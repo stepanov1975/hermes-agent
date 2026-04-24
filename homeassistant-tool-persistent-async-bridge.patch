@@ -1,0 +1,302 @@
+From 8d34636c66b4461fab5af56ca1982522240c67fe Mon Sep 17 00:00:00 2001
+From: Hermes Agent <hermes@local>
+Date: Tue, 21 Apr 2026 07:57:38 +0000
+Subject: [PATCH] fix(tools): reuse persistent loop in Home Assistant async
+ bridge
+
+Keep homeassistant_tool._run_async() on persistent event loops across main-thread, worker-thread, and already-running-loop call modes. Replace the remaining per-call asyncio.run() path with a background bridge loop and add regression coverage for running-loop reuse.
+---
+ tests/tools/test_homeassistant_tool.py | 119 ++++++++++++++++++++++++-
+ tools/homeassistant_tool.py            |  98 ++++++++++++++++++--
+ 2 files changed, 208 insertions(+), 9 deletions(-)
+
+diff --git a/tests/tools/test_homeassistant_tool.py b/tests/tools/test_homeassistant_tool.py
+index 654424a0..d9a66276 100644
+--- a/tests/tools/test_homeassistant_tool.py
++++ b/tests/tools/test_homeassistant_tool.py
+@@ -1,10 +1,12 @@
+ """Tests for the Home Assistant tool module.
+ 
+ Tests real logic: entity filtering, payload building, response parsing,
+-handler validation, and availability gating.
++handler validation, availability gating, and async bridge lifecycle.
+ """
+ 
++import asyncio
+ import json
++import threading
+ from unittest.mock import patch
+ 
+ import pytest
+@@ -323,6 +325,7 @@ class TestCallServiceStringData:
+             "data": '{"hvac_mode": "heat"}',
+         })
+         call_args = mock_run.call_args[0][0]  # the coroutine arg
++        call_args.close()
+         # _run_async was called, meaning we got past validation
+ 
+     @patch("tools.homeassistant_tool._run_async", return_value={"success": True})
+@@ -335,6 +338,7 @@ class TestCallServiceStringData:
+             "data": {"brightness": 255},
+         })
+         mock_run.assert_called_once()
++        mock_run.call_args[0][0].close()
+ 
+     def test_invalid_json_string_returns_error(self):
+         """Malformed JSON string in data returns a clear error."""
+@@ -357,6 +361,7 @@ class TestCallServiceStringData:
+             "data": "   ",
+         })
+         mock_run.assert_called_once()
++        mock_run.call_args[0][0].close()
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -514,3 +519,115 @@ class TestRegistration:
+         monkeypatch.setenv("HASS_TOKEN", "test-token")
+         defs = registry.get_definitions({"ha_list_entities", "ha_get_state", "ha_call_service"})
+         assert len(defs) == 3
++
++
++# ---------------------------------------------------------------------------
++# Async bridge lifecycle regression tests
++# ---------------------------------------------------------------------------
++
++
++async def _get_current_loop():
++    """Return the running event loop from inside a coroutine."""
++    return asyncio.get_event_loop()
++
++
++class TestRunAsyncLoopLifecycle:
++    """Verify homeassistant_tool._run_async keeps loops alive."""
++
++    def test_loop_not_closed_after_run_async(self):
++        from tools.homeassistant_tool import _run_async
++
++        loop = _run_async(_get_current_loop())
++
++        assert not loop.is_closed(), (
++            "homeassistant_tool._run_async() closed the event loop — "
++            "aiohttp clients can emit unclosed session/connector warnings"
++        )
++
++    def test_same_loop_reused_across_calls(self):
++        from tools.homeassistant_tool import _run_async
++
++        loop1 = _run_async(_get_current_loop())
++        loop2 = _run_async(_get_current_loop())
++
++        assert loop1 is loop2, (
++            "homeassistant_tool._run_async() created a new loop on the "
++            "second call instead of reusing a persistent loop"
++        )
++
++    def test_running_loop_calls_use_persistent_background_loop(self):
++        from tools.homeassistant_tool import _run_async
++
++        async def _run_twice_inside_running_loop():
++            loop1 = _run_async(_get_current_loop())
++            loop2 = _run_async(_get_current_loop())
++            return loop1, loop2
++
++        loop1, loop2 = asyncio.run(_run_twice_inside_running_loop())
++
++        assert loop1 is loop2, (
++            "Calls from inside a running event loop should reuse the same "
++            "persistent background loop"
++        )
++        assert not loop1.is_closed(), (
++            "Background loop used for running-loop calls was closed after "
++            "_run_async returned"
++        )
++
++
++class TestRunAsyncWorkerThread:
++    """Verify worker threads also keep a persistent loop."""
++
++    def test_worker_thread_loop_not_closed(self):
++        from concurrent.futures import ThreadPoolExecutor
++        from tools.homeassistant_tool import _run_async
++
++        def _run_on_worker():
++            loop = _run_async(_get_current_loop())
++            still_open = not loop.is_closed()
++            return loop, still_open
++
++        with ThreadPoolExecutor(max_workers=1) as pool:
++            _loop, still_open = pool.submit(_run_on_worker).result()
++
++        assert still_open, (
++            "Worker thread event loop was closed after _run_async returned"
++        )
++
++    def test_worker_thread_reuses_loop_across_calls(self):
++        from concurrent.futures import ThreadPoolExecutor
++        from tools.homeassistant_tool import _run_async
++
++        def _run_twice_on_worker():
++            loop1 = _run_async(_get_current_loop())
++            loop2 = _run_async(_get_current_loop())
++            return loop1, loop2
++
++        with ThreadPoolExecutor(max_workers=1) as pool:
++            loop1, loop2 = pool.submit(_run_twice_on_worker).result()
++
++        assert loop1 is loop2, (
++            "Worker thread created different loops for consecutive calls"
++        )
++        assert not loop1.is_closed()
++
++    def test_parallel_workers_get_separate_loops(self):
++        from concurrent.futures import ThreadPoolExecutor, as_completed
++        from tools.homeassistant_tool import _run_async
++
++        barrier = threading.Barrier(3, timeout=5)
++
++        def _get_loop_id():
++            loop = _run_async(_get_current_loop())
++            barrier.wait()
++            return id(loop), not loop.is_closed(), threading.current_thread().ident
++
++        with ThreadPoolExecutor(max_workers=3) as pool:
++            futures = [pool.submit(_get_loop_id) for _ in range(3)]
++            results = [f.result() for f in as_completed(futures)]
++
++        loop_ids = {result[0] for result in results}
++        thread_ids = {result[2] for result in results}
++        assert all(result[1] for result in results)
++        assert len(thread_ids) == 3
++        assert len(loop_ids) == 3
+diff --git a/tools/homeassistant_tool.py b/tools/homeassistant_tool.py
+index 2e698a45..2eeb2096 100644
+--- a/tools/homeassistant_tool.py
++++ b/tools/homeassistant_tool.py
+@@ -15,6 +15,7 @@ import json
+ import logging
+ import os
+ import re
++import threading
+ from typing import Any, Dict, Optional
+ 
+ logger = logging.getLogger(__name__)
+@@ -27,6 +28,80 @@ logger = logging.getLogger(__name__)
+ _HASS_URL: str = ""
+ _HASS_TOKEN: str = ""
+ 
++# Persistent event loops for sync->async bridging. Using asyncio.run() per call
++# creates and then closes a new event loop every time, which can orphan cached
++# async client transports and surface as "Unclosed client session" warnings.
++_tool_loop = None
++_tool_loop_lock = threading.Lock()
++_worker_thread_local = threading.local()
++_async_context_loop = None
++_async_context_loop_thread = None
++_async_context_loop_lock = threading.Lock()
++
++
++def _run_background_loop(loop: asyncio.AbstractEventLoop, ready: threading.Event) -> None:
++    """Own a persistent event loop on a dedicated daemon thread."""
++    asyncio.set_event_loop(loop)
++    ready.set()
++    loop.run_forever()
++
++
++def _get_async_context_loop() -> asyncio.AbstractEventLoop:
++    """Return a persistent background loop for calls made inside a running loop."""
++    global _async_context_loop, _async_context_loop_thread
++    with _async_context_loop_lock:
++        if (
++            _async_context_loop is None
++            or _async_context_loop.is_closed()
++            or _async_context_loop_thread is None
++            or not _async_context_loop_thread.is_alive()
++        ):
++            loop = asyncio.new_event_loop()
++            ready = threading.Event()
++            thread = threading.Thread(
++                target=_run_background_loop,
++                args=(loop, ready),
++                name="homeassistant-tool-async-bridge",
++                daemon=True,
++            )
++            thread.start()
++            if not ready.wait(timeout=5):
++                loop.close()
++                raise RuntimeError("Timed out starting Home Assistant async bridge loop")
++            _async_context_loop = loop
++            _async_context_loop_thread = thread
++        return _async_context_loop
++
++
++def _submit_to_async_context_loop(coro):
++    """Run a coroutine on the persistent async-context bridge loop."""
++    bridge_loop = _get_async_context_loop()
++    future = asyncio.run_coroutine_threadsafe(coro, bridge_loop)
++    try:
++        return future.result(timeout=30)
++    except Exception:
++        future.cancel()
++        raise
++
++
++def _get_tool_loop():
++    """Return a long-lived event loop for main-thread tool calls."""
++    global _tool_loop
++    with _tool_loop_lock:
++        if _tool_loop is None or _tool_loop.is_closed():
++            _tool_loop = asyncio.new_event_loop()
++        return _tool_loop
++
++
++def _get_worker_loop():
++    """Return a persistent event loop for the current worker thread."""
++    loop = getattr(_worker_thread_local, "loop", None)
++    if loop is None or loop.is_closed():
++        loop = asyncio.new_event_loop()
++        asyncio.set_event_loop(loop)
++        _worker_thread_local.loop = loop
++    return loop
++
+ 
+ def _get_config():
+     """Return (hass_url, hass_token) from env vars at call time."""
+@@ -205,20 +280,27 @@ async def _async_call_service(
+ # ---------------------------------------------------------------------------
+ 
+ def _run_async(coro):
+-    """Run an async coroutine from a sync handler."""
++    """Run an async coroutine from a sync handler.
++
++    When possible, reuse a persistent event loop instead of asyncio.run(),
++    which creates and closes a fresh loop on every call. Reusing loops keeps
++    async client cleanup bound to a live loop and avoids aiohttp unclosed
++    session/connector warnings.
++    """
+     try:
+         loop = asyncio.get_running_loop()
+     except RuntimeError:
+         loop = None
+ 
+     if loop and loop.is_running():
+-        # Already inside an event loop -- create a new thread
+-        import concurrent.futures
+-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+-            future = pool.submit(asyncio.run, coro)
+-            return future.result(timeout=30)
+-    else:
+-        return asyncio.run(coro)
++        return _submit_to_async_context_loop(coro)
++
++    if threading.current_thread() is not threading.main_thread():
++        worker_loop = _get_worker_loop()
++        return worker_loop.run_until_complete(coro)
++
++    tool_loop = _get_tool_loop()
++    return tool_loop.run_until_complete(coro)
+ 
+ 
+ def _handle_list_entities(args: dict, **kw) -> str:
+-- 
+2.43.0
+
