@@ -867,6 +867,10 @@ def _cleanup_all_browsers(*args, **kwargs):
 
 # Guard to prevent cleanup from running multiple times on exit
 _cleanup_done = False
+# Guard to prevent session finalization from running multiple times. Resource
+# cleanup may still run later, but memory/session-end hooks must be in-band
+# before interpreter teardown and idempotent when atexit fires as fallback.
+_session_finalize_done = False
 # Weak reference to the active AIAgent for memory provider shutdown at exit
 _active_agent_ref = None
 _deferred_agent_startup_done = False
@@ -915,34 +919,18 @@ def _prepare_deferred_agent_startup() -> None:
             exc_info=True,
         )
 
-def _run_cleanup():
-    """Run resource cleanup exactly once."""
-    global _cleanup_done
-    if _cleanup_done:
-        return
-    _cleanup_done = True
+def _finalize_active_session():
+    """Finalize the active CLI session exactly once, before interpreter teardown.
 
-    try:
-        _cleanup_all_terminals()
-    except Exception:
-        pass
-    try:
-        _cleanup_all_browsers()
-    except Exception:
-        pass
-    try:
-        from tools.mcp_tool import shutdown_mcp_servers
-        shutdown_mcp_servers()
-    except Exception:
-        pass
-    # Close cached auxiliary LLM clients (sync + async) so that
-    # AsyncHttpxClientWrapper.__del__ doesn't fire on a closed event loop
-    # and trigger prompt_toolkit's "Press ENTER to continue..." handler.
-    try:
-        from agent.auxiliary_client import shutdown_cached_clients
-        shutdown_cached_clients()
-    except Exception:
-        pass
+    Memory providers such as Hindsight can own queues, aiohttp clients, and
+    executor-backed async cleanup. Those must be drained while Python is still
+    fully operational; ``atexit`` remains only a fallback for abnormal exits.
+    """
+    global _session_finalize_done
+    if _session_finalize_done:
+        return
+    _session_finalize_done = True
+
     # Shut down memory provider (on_session_end + shutdown_all) at actual
     # session boundary — NOT per-turn inside run_conversation().
     try:
@@ -963,6 +951,38 @@ def _run_cleanup():
                 _active_agent_ref.shutdown_memory_provider(_session_msgs)
             else:
                 _active_agent_ref.shutdown_memory_provider()
+    except Exception:
+        pass
+
+
+def _run_cleanup():
+    """Run resource cleanup exactly once."""
+    global _cleanup_done
+    if _cleanup_done:
+        return
+    _cleanup_done = True
+
+    _finalize_active_session()
+
+    try:
+        _cleanup_all_terminals()
+    except Exception:
+        pass
+    try:
+        _cleanup_all_browsers()
+    except Exception:
+        pass
+    try:
+        from tools.mcp_tool import shutdown_mcp_servers
+        shutdown_mcp_servers()
+    except Exception:
+        pass
+    # Close cached auxiliary LLM clients (sync + async) so that
+    # AsyncHttpxClientWrapper.__del__ doesn't fire on a closed event loop
+    # and trigger prompt_toolkit's "Press ENTER to continue..." handler.
+    try:
+        from agent.auxiliary_client import shutdown_cached_clients
+        shutdown_cached_clients()
     except Exception:
         pass
 
@@ -11672,6 +11692,12 @@ class HermesCLI:
             request_overrides=turn_route.get("request_overrides"),
         ):
             return None
+        if self.agent is not None:
+            setattr(
+                self.agent,
+                "_skip_memory_prefetch_after_turn",
+                bool(getattr(self, "_skip_memory_prefetch_after_turn", False)),
+            )
         
         # Route image attachments based on the active model's vision capability.
         # "native" → pass pixels as OpenAI-style content parts (adapters
@@ -15264,45 +15290,60 @@ def main(
                 ):
                     cli.agent.quiet_mode = True
                     cli.agent.suppress_status_output = True
+                    # One-shot CLI processes have no next turn to warm.
+                    # Avoid starting background prefetch that shutdown must
+                    # immediately join/close, which can leave aiohttp sessions
+                    # racing process exit.
+                    setattr(cli.agent, "_skip_memory_prefetch_after_turn", True)
                     # Suppress streaming display callbacks so stdout stays
                     # machine-readable (no styled "Hermes" box, no tool-gen
                     # status lines).  The response is printed once below.
                     cli.agent.stream_delta_callback = None
                     cli.agent.tool_gen_callback = None
-                    result = cli.agent.run_conversation(
-                        user_message=effective_query,
-                        conversation_history=cli.conversation_history,
-                    )
-                    # Sync session_id if mid-run compression created a
-                    # continuation session. The exit line below reports
-                    # session_id to stderr for automation wrappers; without
-                    # this sync it would point at the ended parent.
-                    if (
-                        getattr(cli.agent, "session_id", None)
-                        and cli.agent.session_id != cli.session_id
-                    ):
-                        cli.session_id = cli.agent.session_id
-                    response = result.get("final_response", "") if isinstance(result, dict) else str(result)
-                    # Surface backend errors that produced no visible output
-                    # (e.g. invalid model slug → provider 4xx). Mirrors the
-                    # interactive CLI path. Write to stderr so piped stdout
-                    # stays clean for automation wrappers.
-                    if (
-                        not response
-                        and isinstance(result, dict)
-                        and result.get("error")
-                        and (result.get("failed") or result.get("partial"))
-                    ):
-                        print(f"Error: {result['error']}", file=sys.stderr)
-                    elif response:
-                        print(response)
-                    # Session ID goes to stderr so piped stdout is clean.
-                    print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
-                    
-                    # Ensure proper exit code for automation wrappers
-                    sys.exit(1 if isinstance(result, dict) and result.get("failed") else 0)
+                    try:
+                        result = cli.agent.run_conversation(
+                            user_message=effective_query,
+                            conversation_history=cli.conversation_history,
+                        )
+                        # Sync session_id if mid-run compression created a
+                        # continuation session. The exit line below reports
+                        # session_id to stderr for automation wrappers; without
+                        # this sync it would point at the ended parent.
+                        if (
+                            getattr(cli.agent, "session_id", None)
+                            and cli.agent.session_id != cli.session_id
+                        ):
+                            cli.session_id = cli.agent.session_id
+                        response = result.get("final_response", "") if isinstance(result, dict) else str(result)
+                        # Surface backend errors that produced no visible output
+                        # (e.g. invalid model slug → provider 4xx). Mirrors the
+                        # interactive CLI path. Write to stderr so piped stdout
+                        # stays clean for automation wrappers.
+                        if (
+                            not response
+                            and isinstance(result, dict)
+                            and result.get("error")
+                            and (result.get("failed") or result.get("partial"))
+                        ):
+                            print(f"Error: {result['error']}", file=sys.stderr)
+                        elif response:
+                            print(response)
+                        # Session ID goes to stderr so piped stdout is clean.
+                        print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
+
+                        # Ensure proper exit code for automation wrappers.
+                        exit_code = 1 if isinstance(result, dict) and result.get("failed") else 0
+                    finally:
+                        # Run cleanup explicitly before sys.exit()/exception
+                        # unwinding so memory providers drain queues/close
+                        # async clients before CPython's atexit interpreter-
+                        # shutdown phase disables executor scheduling.
+                        _run_cleanup()
+                    sys.exit(exit_code)
             
-            # Exit with error code if credentials or agent init fails
+            # Exit with error code if credentials or agent init fails. Still
+            # run cleanup in case earlier setup opened any process resources.
+            _run_cleanup()
             sys.exit(1)
         else:
             # Single-query mode (`hermes chat -q "…"`): skip the welcome
@@ -15319,12 +15360,16 @@ def main(
             # facing single-query path in line so all non-interactive
             # invocations are fast.
             _query_label = query or ("[image attached]" if single_query_images else "")
+            setattr(cli, "_skip_memory_prefetch_after_turn", True)
             if _query_label:
                 cli.console.print(f"[bold blue]Query:[/] {_query_label}")
             # Surface security advisories before the agent runs — short
             # banner, doesn't depend on the welcome banner being shown.
             cli._show_security_advisories()
-            cli.chat(query, images=single_query_images or None)
+            try:
+                cli.chat(query, images=single_query_images or None)
+            finally:
+                _run_cleanup()
             cli._print_exit_summary()
         return
     

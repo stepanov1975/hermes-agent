@@ -213,6 +213,9 @@ def _make_hindsight_provider():
     provider._session_turns = ["turn-1", "turn-2"]
     provider._turn_counter = 2
     provider._turn_index = 2
+    provider._last_enqueued_turn_count = 0
+    provider._append_enqueued_turn_counts = {}
+    provider._append_retained_turn_counts = {}
     # Attrs read by _build_metadata / _build_retain_kwargs when the
     # buffer-flush path on session switch fires. Empty strings keep the
     # metadata minimal but well-formed.

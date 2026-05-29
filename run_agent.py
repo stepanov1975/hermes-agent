@@ -2292,9 +2292,9 @@ class AIAgent:
 
         Called at the end of ``run_conversation`` with the cleaned user
         message (``original_user_message``) and the finalised assistant
-        response.  The external memory backend gets both ``sync_all`` (to
-        persist the exchange) and ``queue_prefetch_all`` (to start
-        warming context for the next turn) in one shot.
+        response.  The external memory backend gets ``sync_all`` to persist
+        the exchange and, for reusable sessions, ``queue_prefetch_all`` to
+        start warming context for the next turn.
 
         Uses ``original_user_message`` rather than ``user_message``
         because the latter may carry injected skill content that bloats
@@ -2327,10 +2327,11 @@ class AIAgent:
                 final_response,
                 **sync_kwargs,
             )
-            self._memory_manager.queue_prefetch_all(
-                original_user_message,
-                session_id=self.session_id or "",
-            )
+            if not getattr(self, "_skip_memory_prefetch_after_turn", False):
+                self._memory_manager.queue_prefetch_all(
+                    original_user_message,
+                    session_id=self.session_id or "",
+                )
         except Exception:
             pass
 
