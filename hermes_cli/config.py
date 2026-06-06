@@ -1631,7 +1631,14 @@ DEFAULT_CONFIG = {
     #   approve — auto-approve all dangerous commands in cron jobs
     "approvals": {
         "mode": "manual",
+        # CLI prompt timeout in seconds. Gateway/messaging approvals use
+        # gateway_timeout below so slow chat responses don't inherit the
+        # tighter local input() window.
         "timeout": 60,
+        # Gateway/messaging approval wait timeout in seconds. Config is read
+        # when each approval request starts; existing pending approvals keep
+        # the timeout they started with.
+        "gateway_timeout": 300,
         "cron_mode": "deny",
         # When true, /reload-mcp asks the user to confirm before rebuilding
         # the MCP tool set for the active session.  Reloading invalidates

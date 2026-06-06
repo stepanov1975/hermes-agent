@@ -1634,7 +1634,9 @@ Control how Hermes handles potentially dangerous commands:
 
 ```yaml
 approvals:
-  mode: manual   # manual | smart | off
+  mode: manual          # manual | smart | off
+  timeout: 60           # CLI approval prompt timeout, seconds
+  gateway_timeout: 300  # messaging/gateway approval wait timeout, seconds
 ```
 
 | Mode | Behavior |
@@ -1644,6 +1646,8 @@ approvals:
 | `off` | Skip all approval checks. Equivalent to `HERMES_YOLO_MODE=true`. **Use with caution.** |
 
 Smart mode is particularly useful for reducing approval fatigue — it lets the agent work more autonomously on safe operations while still catching genuinely destructive commands.
+
+`approvals.timeout` only controls local CLI approval prompts. Messaging-platform approvals (Telegram, Slack, Discord, etc.) use `approvals.gateway_timeout`; Hermes reads that value when each approval request starts, so future gateway prompts pick up config changes without restarting the gateway. A prompt already waiting keeps the timeout it started with.
 
 :::warning
 Setting `approvals.mode: off` disables all safety checks for terminal commands. Only use this in trusted, sandboxed environments.
