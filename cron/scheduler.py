@@ -365,6 +365,95 @@ def _get_home_target_thread_id(platform_name: str) -> Optional[str]:
     return value or None
 
 
+def _looks_like_int(value) -> bool:
+    try:
+        int(str(value).strip())
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def _looks_like_telegram_private_chat_id(value) -> bool:
+    try:
+        return int(str(value).strip()) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _parse_telegram_named_private_topic_target(rest: str) -> Optional[tuple[str, str]]:
+    """Parse ``<private_chat_id>:<topic name>`` cron targets.
+
+    ``tools.send_message_tool._parse_target_ref`` intentionally only accepts
+    numeric Telegram thread IDs. Cron is a proactive sender: for private-chat
+    topics the safe target is the stable topic name, because the Telegram
+    adapter can resolve/create the current ``message_thread_id`` at send time.
+    """
+
+    if ":" not in str(rest):
+        return None
+    chat_id, topic_name = str(rest).split(":", 1)
+    chat_id = chat_id.strip()
+    topic_name = topic_name.strip()
+    if not chat_id or not topic_name:
+        return None
+    if not _looks_like_telegram_private_chat_id(chat_id):
+        return None
+    if _looks_like_int(topic_name):
+        return None
+    return chat_id, topic_name
+
+
+def _configured_telegram_dm_topic_thread_id(pconfig, chat_id: str, topic_name: str) -> Optional[str]:
+    """Resolve a configured Telegram private DM topic name to its thread id."""
+
+    extra = getattr(pconfig, "extra", None) or {}
+    if not isinstance(extra, dict):
+        return None
+    for entry in extra.get("dm_topics", []) or []:
+        if str(entry.get("chat_id")) != str(chat_id):
+            continue
+        for topic in entry.get("topics", []) or []:
+            if topic.get("name") == topic_name and topic.get("thread_id"):
+                return str(topic["thread_id"])
+    return None
+
+
+def _resolve_named_telegram_dm_topic_thread_id(
+    *,
+    pconfig,
+    chat_id: str,
+    topic_name: str,
+    runtime_adapter=None,
+    loop=None,
+) -> Optional[str]:
+    """Resolve/create a named Telegram private DM topic for cron delivery."""
+
+    ensure_dm_topic = getattr(runtime_adapter, "ensure_dm_topic", None) if runtime_adapter is not None else None
+    if ensure_dm_topic is not None and loop is not None and getattr(loop, "is_running", lambda: False)():
+        from agent.async_utils import safe_schedule_threadsafe
+
+        future = safe_schedule_threadsafe(
+            ensure_dm_topic(chat_id, topic_name),
+            loop,
+            logger=logger,
+            log_message="Failed to schedule Telegram DM topic resolution",
+        )
+        if future is not None:
+            try:
+                thread_id = future.result(timeout=60)
+                if thread_id:
+                    return str(thread_id)
+            except Exception:
+                logger.debug(
+                    "Failed to resolve Telegram DM topic %s:%s through live adapter",
+                    chat_id,
+                    topic_name,
+                    exc_info=True,
+                )
+
+    return _configured_telegram_dm_topic_thread_id(pconfig, chat_id, topic_name)
+
+
 def _iter_home_target_platforms():
     """Iterate built-in + plugin platform names that expose a home channel.
 
@@ -459,6 +548,18 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
     if ":" in deliver_value:
         platform_name, rest = deliver_value.split(":", 1)
         platform_key = platform_name.lower()
+
+        named_telegram_private_topic = None
+        if platform_key == "telegram":
+            named_telegram_private_topic = _parse_telegram_named_private_topic_target(rest)
+        if named_telegram_private_topic:
+            chat_id, topic_name = named_telegram_private_topic
+            return {
+                "platform": platform_name,
+                "chat_id": chat_id,
+                "thread_id": topic_name,
+                "telegram_named_private_topic": True,
+            }
 
         from tools.send_message_tool import _parse_target_ref
 
@@ -755,9 +856,30 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         # Prefer the live adapter when the gateway is running — this supports E2EE
         # rooms (e.g. Matrix) where the standalone HTTP path cannot encrypt.
         runtime_adapter = (adapters or {}).get(platform)
+        named_telegram_private_topic = bool(target.get("telegram_named_private_topic"))
+        if named_telegram_private_topic:
+            topic_name = str(thread_id or "").strip()
+            resolved_thread_id = _resolve_named_telegram_dm_topic_thread_id(
+                pconfig=pconfig,
+                chat_id=str(chat_id),
+                topic_name=topic_name,
+                runtime_adapter=runtime_adapter,
+                loop=loop,
+            )
+            if not resolved_thread_id:
+                msg = f"Telegram DM topic '{topic_name}' not found for chat {chat_id}"
+                logger.error("Job '%s': %s", job["id"], msg)
+                delivery_errors.append(msg)
+                continue
+            thread_id = resolved_thread_id
+
         delivered = False
         if runtime_adapter is not None and loop is not None and getattr(loop, "is_running", lambda: False)():
-            send_metadata = {"thread_id": thread_id} if thread_id else None
+            send_metadata = None
+            if thread_id:
+                send_metadata = {"thread_id": thread_id}
+                if named_telegram_private_topic:
+                    send_metadata["telegram_dm_topic_created_for_send"] = True
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content
                 text_to_send = cleaned_delivery_content.strip()
