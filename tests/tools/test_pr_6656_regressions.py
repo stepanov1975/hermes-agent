@@ -241,6 +241,29 @@ class TestBundleHashFilenameSensitivity:
 
         assert bundle_content_hash(bundle) == content_hash(skill_dir)
 
+    def test_bundle_and_disk_hash_match_for_file_and_prefix_directory(self, tmp_path):
+        """Path ordering must match bundle ordering even when a file path
+        is also the prefix of a directory path, e.g. ``references/styles.md``
+        and ``references/styles/foo.md``. ``Path`` component sorting orders
+        those differently from sorted POSIX strings, which caused clean hub
+        installs to be reported as outdated forever."""
+        skill_dir = tmp_path / "skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text("hello")
+        references = skill_dir / "references"
+        references.mkdir()
+        (references / "styles.md").write_text("overview")
+        (references / "styles").mkdir()
+        (references / "styles" / "blueprint.md").write_text("details")
+
+        bundle = self._make_bundle({
+            "SKILL.md": "hello",
+            "references/styles.md": "overview",
+            "references/styles/blueprint.md": "details",
+        })
+
+        assert bundle_content_hash(bundle) == content_hash(skill_dir)
+
 
 # =============================================================================
 # PairingStore.list_pending: must hold the lock

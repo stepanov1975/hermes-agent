@@ -179,7 +179,6 @@ def test_sync_all_propagates_session_id_to_providers():
     p = _RecordingProvider()
     mm.add_provider(p)
     mm.sync_all("hello", "world", session_id="sess-42")
-    mm.flush_pending(timeout=5)
     assert p.sync_calls == [
         {"user": "hello", "asst": "world", "session_id": "sess-42"}
     ]
@@ -190,7 +189,6 @@ def test_queue_prefetch_all_propagates_session_id_to_providers():
     p = _RecordingProvider()
     mm.add_provider(p)
     mm.queue_prefetch_all("next query", session_id="sess-42")
-    mm.flush_pending(timeout=5)
     assert p.queue_calls == [{"query": "next query", "session_id": "sess-42"}]
 
 
@@ -215,6 +213,9 @@ def _make_hindsight_provider():
     provider._session_turns = ["turn-1", "turn-2"]
     provider._turn_counter = 2
     provider._turn_index = 2
+    provider._last_enqueued_turn_count = 0
+    provider._append_enqueued_turn_counts = {}
+    provider._append_retained_turn_counts = {}
     # Attrs read by _build_metadata / _build_retain_kwargs when the
     # buffer-flush path on session switch fires. Empty strings keep the
     # metadata minimal but well-formed.
