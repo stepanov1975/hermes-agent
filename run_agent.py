@@ -4274,7 +4274,29 @@ class AIAgent:
         except Exception:
             pass
 
-        # 7. Free conversation history.  Mirrors _release_evicted_agent_soft's
+        # 7. Shut down the memory provider and context engine.  This releases
+        # per-session background threads (e.g. Honcho's honcho-async-writer
+        # and honcho-prewarm-dialectic) and provider connections that would
+        # otherwise survive session teardown and accumulate as leaks.
+        #
+        # Must run BEFORE clearing _session_messages so providers receive the
+        # actual conversation transcript for on_session_end() extraction, not
+        # an empty list.
+        #
+        # The gateway path (gateway/run.py) calls shutdown_memory_provider()
+        # explicitly at session boundaries, but close() is the single terminal
+        # path for CLI, TUI/dashboard, subagent, and cron contexts — all of
+        # which go through close() without calling shutdown_memory_provider().
+        #
+        # See #46082: dashboard process leaked ~2 Honcho threads per session
+        # because agent.close() never triggered the shutdown chain.
+        try:
+            _messages_for_shutdown = list(getattr(self, "_session_messages", []) or [])
+            self.shutdown_memory_provider(_messages_for_shutdown)
+        except Exception:
+            pass
+
+        # 8. Free conversation history.  Mirrors _release_evicted_agent_soft's
         # soft-eviction clear — close() is the hard teardown for true session
         # boundaries (/new, /reset, session expiry), so the message list won't
         # be reused.  Drops the reference proactively rather than waiting for
@@ -4307,23 +4329,6 @@ class AIAgent:
                 session_id = getattr(self, "session_id", None)
                 if session_db and session_id:
                     session_db.end_session(session_id, "agent_close")
-        except Exception:
-            pass
-
-        # 8. Shut down the memory provider and context engine.  This releases
-        # per-session background threads (e.g. Honcho's honcho-async-writer
-        # and honcho-prewarm-dialectic) and provider connections that would
-        # otherwise survive session teardown and accumulate as leaks.
-        #
-        # The gateway path (gateway/run.py) calls shutdown_memory_provider()
-        # explicitly at session boundaries, but close() is the single terminal
-        # path for CLI, TUI/dashboard, subagent, and cron contexts — all of
-        # which go through close() without calling shutdown_memory_provider().
-        #
-        # See #46082: dashboard process leaked ~2 Honcho threads per session
-        # because agent.close() never triggered the shutdown chain.
-        try:
-            self.shutdown_memory_provider()
         except Exception:
             pass
 
