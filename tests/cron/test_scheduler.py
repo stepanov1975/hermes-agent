@@ -274,6 +274,17 @@ class TestResolveDeliveryTarget:
             "thread_id": "17",
         }
 
+    def test_explicit_telegram_private_named_topic_target(self):
+        """deliver: 'telegram:private_chat_id:topic name' preserves named DM topics."""
+        job = {
+            "deliver": "telegram:722341991:Debug",
+        }
+        assert _resolve_delivery_target(job) == {
+            "platform": "telegram",
+            "chat_id": "722341991",
+            "thread_id": "Debug",
+        }
+
     def test_explicit_telegram_topic_thread_survives_bare_directory_match(self):
         """Exact channel-directory matches must not erase an explicit topic id."""
         job = {
@@ -3418,6 +3429,141 @@ class TestDeliverResultTimeoutCancelsFuture:
         assert str(media_metadata.get("direct_messages_topic_id")) == "7072"
         assert not media_metadata.get("message_thread_id")
         assert not media_metadata.get("thread_id")
+
+    def test_live_adapter_named_private_dm_topic_is_created_before_delivery(self):
+        """Named private DM topic cron targets must route through DeliveryRouter."""
+        from gateway.config import Platform
+        from gateway.platforms.base import SendResult
+        from concurrent.futures import Future
+
+        adapter = MagicMock()
+        adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="42"))
+        adapter.ensure_dm_topic = AsyncMock(return_value="38132")
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        mock_cfg.filter_silence_narration = False
+
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        job = {
+            "id": "named-dm-topic-job",
+            "deliver": "telegram:722341991:Debug",
+        }
+
+        def fake_run_coro(coro, _loop):
+            import asyncio as _asyncio
+            future = Future()
+            try:
+                future.set_result(_asyncio.run(coro))
+            except BaseException as _e:  # noqa: BLE001
+                future.set_exception(_e)
+            return future
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
+            result = _deliver_result(
+                job,
+                "Hello world",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+            )
+
+        assert result is None, f"expected clean delivery, got: {result!r}"
+        adapter.ensure_dm_topic.assert_awaited_once_with("722341991", "Debug")
+        sent_metadata = adapter.send.call_args[1]["metadata"]
+        assert sent_metadata["thread_id"] == "38132"
+        assert sent_metadata["telegram_dm_topic_created_for_send"] is True
+
+    def test_live_adapter_named_private_dm_topic_media_resolves_topic_name(self, tmp_path, monkeypatch):
+        """MEDIA-only named private DM topic cron output must not send raw topic names."""
+        from gateway.config import Platform
+        from gateway.platforms.base import SendResult
+        from concurrent.futures import Future
+
+        media_root = tmp_path / "media-cache"
+        media_file = media_root / "chart.png"
+        media_file.parent.mkdir(parents=True, exist_ok=True)
+        media_file.write_bytes(b"media")
+        monkeypatch.setattr(
+            "gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS",
+            (media_root,),
+        )
+        media_path = media_file.resolve()
+
+        adapter = MagicMock()
+        adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="1"))
+        adapter.send_image_file = AsyncMock(return_value=SendResult(success=True, message_id="2"))
+        adapter.ensure_dm_topic = AsyncMock(return_value="38132")
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        mock_cfg.filter_silence_narration = False
+
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        job = {
+            "id": "named-dm-topic-media-job",
+            "deliver": "telegram:722341991:Debug",
+        }
+
+        def fake_run_coro(coro, _loop):
+            import asyncio as _asyncio
+            future = Future()
+            try:
+                future.set_result(_asyncio.run(coro))
+            except BaseException as _e:  # noqa: BLE001
+                future.set_exception(_e)
+            return future
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
+            result = _deliver_result(
+                job,
+                f"MEDIA:{media_path}",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+            )
+
+        assert result is None, f"expected clean delivery, got: {result!r}"
+        adapter.send.assert_not_called()
+        adapter.send_image_file.assert_called_once()
+        adapter.ensure_dm_topic.assert_awaited_once_with("722341991", "Debug", force_create=False)
+        media_metadata = adapter.send_image_file.call_args[1]["metadata"]
+        assert media_metadata["thread_id"] == "38132"
+        assert media_metadata["telegram_dm_topic_created_for_send"] is True
+
+    def test_named_private_dm_topic_refuses_standalone_fallback(self):
+        """Named private DM topics need the live adapter to create/refresh the topic."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        standalone_send = AsyncMock(return_value={"success": True})
+        job = {
+            "id": "named-dm-topic-standalone-job",
+            "deliver": "telegram:722341991:Debug",
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("tools.send_message_tool._send_to_platform", new=standalone_send):
+            result = _deliver_result(job, "Hello world", adapters={}, loop=None)
+
+        assert result is not None
+        assert "requires the live Telegram adapter" in result
+        standalone_send.assert_not_awaited()
 
     def test_live_adapter_forum_thread_fallback_records_delivery_error(self):
         """A forum/supergroup cron target whose configured topic is gone must
