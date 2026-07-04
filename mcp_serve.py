@@ -89,7 +89,14 @@ def _load_sessions_index() -> dict:
         return {}
     try:
         with open(sessions_file, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+        # Drop documentation/metadata sentinels (keys starting with "_", e.g.
+        # the "_README" note the gateway writes into the index). They are not
+        # session entries and would break consumers that treat every value as
+        # an entry dict.
+        if isinstance(data, dict):
+            return {k: v for k, v in data.items() if not str(k).startswith("_")}
+        return {}
     except Exception as e:
         logger.debug("Failed to load sessions.json: %s", e)
         return {}
@@ -113,6 +120,25 @@ def _load_channel_directory() -> dict:
     except Exception as e:
         logger.debug("Failed to load channel_directory.json: %s", e)
         return {}
+
+
+def _coerce_int(
+    value,
+    *,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    """Coerce value to int with fallback and clamping.
+
+    Used at MCP tool boundaries to handle invalid types from external clients.
+    Returns default if value cannot be converted to int.
+    """
+    try:
+        coerced = int(value)
+    except (TypeError, ValueError):
+        coerced = default
+    return max(minimum, min(coerced, maximum))
 
 
 def _extract_message_content(msg: dict) -> str:
@@ -150,7 +176,7 @@ def _extract_attachments(msg: dict) -> List[dict]:
                 url = part.get("url", part.get("source", {}).get("url", ""))
                 if url:
                     attachments.append({"type": "image", "url": url})
-            elif ptype not in ("text",):
+            elif ptype not in {"text",}:
                 # Unknown non-text content type
                 attachments.append({"type": ptype, "data": part})
 
@@ -330,7 +356,10 @@ class EventBridge:
         Uses mtime checks on sessions.json and state.db to skip work
         when nothing has changed — makes 200ms polling essentially free.
         """
-        # Check if sessions.json has changed (mtime check is ~1μs)
+        # Check if sessions.json has changed (mtime check is ~1μs).
+        # Capture the previously-seen mtime *before* refreshing the cache so the
+        # skip guard below can still tell whether sessions.json changed this tick.
+        prev_sessions_json_mtime = self._sessions_json_mtime
         sessions_file = _get_sessions_dir() / "sessions.json"
         try:
             sj_mtime = sessions_file.stat().st_mtime if sessions_file.exists() else 0.0
@@ -353,7 +382,16 @@ class EventBridge:
         except OSError:
             db_mtime = 0.0
 
-        if db_mtime == self._state_db_mtime and sj_mtime == self._sessions_json_mtime:
+        # Skip only when NEITHER file changed since the last poll. Comparing
+        # against ``prev_sessions_json_mtime`` (not the freshly-stored
+        # ``self._sessions_json_mtime``) is essential: the latter was just set to
+        # ``sj_mtime`` above, so using it would make the sessions.json term
+        # always true and collapse the guard to a db-only check. That would
+        # discard a tick where only sessions.json changed — e.g. a brand-new
+        # conversation registered after its first message already landed in
+        # state.db on an earlier tick — and the new chat's messages would never
+        # be emitted until state.db happened to change again.
+        if db_mtime == self._state_db_mtime and sj_mtime == prev_sessions_json_mtime:
             return  # Nothing changed since last poll — skip entirely
 
         self._state_db_mtime = db_mtime
@@ -395,7 +433,7 @@ class EventBridge:
             for msg in messages:
                 ts = _ts_float(msg.get("timestamp", 0))
                 role = msg.get("role", "")
-                if role not in ("user", "assistant"):
+                if role not in {"user", "assistant"}:
                     continue
                 if ts > last_seen:
                     new_messages.append(msg)
@@ -465,6 +503,7 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
             limit: Maximum number of conversations to return (default 50)
             search: Optional text to filter conversations by name
         """
+        limit = _coerce_int(limit, default=50, minimum=1, maximum=200)
         entries = _load_sessions_index()
         conversations = []
 
@@ -552,6 +591,7 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
             session_key: The session key from conversations_list
             limit: Maximum number of messages to return (default 50, most recent)
         """
+        limit = _coerce_int(limit, default=50, minimum=1, maximum=200)
         entries = _load_sessions_index()
         entry = entries.get(session_key)
         if not entry:
@@ -573,7 +613,7 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
         filtered = []
         for msg in all_messages:
             role = msg.get("role", "")
-            if role in ("user", "assistant"):
+            if role in {"user", "assistant"}:
                 content = _extract_message_content(msg)
                 if content:
                     filtered.append({
@@ -664,6 +704,8 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
             session_key: Optional filter to one conversation
             limit: Maximum events to return (default 20)
         """
+        after_cursor = _coerce_int(after_cursor, default=0, minimum=0, maximum=10**18)
+        limit = _coerce_int(limit, default=20, minimum=1, maximum=200)
         result = bridge.poll_events(
             after_cursor=after_cursor,
             session_key=session_key,
@@ -689,10 +731,17 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
             session_key: Optional filter to one conversation
             timeout_ms: Maximum wait time in milliseconds (default 30000)
         """
+        after_cursor = _coerce_int(after_cursor, default=0, minimum=0, maximum=10**18)
+        timeout_ms = _coerce_int(
+            timeout_ms,
+            default=30000,
+            minimum=0,
+            maximum=300000,
+        )  # Cap at 5 minutes
         event = bridge.wait_for_event(
             after_cursor=after_cursor,
             session_key=session_key,
-            timeout_ms=min(timeout_ms, 300000),  # Cap at 5 minutes
+            timeout_ms=timeout_ms,
         )
         if event:
             return json.dumps({"event": event}, indent=2)
@@ -772,7 +821,7 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
             return json.dumps({"count": len(targets), "channels": targets}, indent=2)
 
         channels = []
-        for plat, entries_list in directory.items():
+        for plat, entries_list in directory.get("platforms", {}).items():
             if platform and plat.lower() != platform.lower():
                 continue
             if isinstance(entries_list, list):
@@ -817,7 +866,7 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
             id: The approval ID from permissions_list_open
             decision: One of "allow-once", "allow-always", or "deny"
         """
-        if decision not in ("allow-once", "allow-always", "deny"):
+        if decision not in {"allow-once", "allow-always", "deny"}:
             return json.dumps({
                 "error": f"Invalid decision: {decision}. "
                          f"Must be allow-once, allow-always, or deny"
