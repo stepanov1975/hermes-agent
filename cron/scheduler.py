@@ -1173,6 +1173,19 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
         parsed_chat_id, parsed_thread_id, is_explicit = _parse_target_ref(platform_key, rest)
         if is_explicit:
             chat_id, thread_id = parsed_chat_id, parsed_thread_id
+        elif platform_key == "telegram" and ":" in rest:
+            candidate_chat_id, candidate_thread_id = rest.split(":", 1)
+            candidate_chat_id = candidate_chat_id.strip()
+            candidate_thread_id = candidate_thread_id.strip()
+            from gateway.delivery import _looks_like_int, looks_like_telegram_private_chat_id
+            if (
+                candidate_thread_id
+                and looks_like_telegram_private_chat_id(candidate_chat_id)
+                and not _looks_like_int(candidate_thread_id)
+            ):
+                chat_id, thread_id = candidate_chat_id, candidate_thread_id
+            else:
+                chat_id, thread_id = rest, None
         else:
             chat_id, thread_id = rest, None
 
@@ -1342,40 +1355,116 @@ def _send_media_via_adapter(
     """
     from pathlib import Path
 
+    from agent.async_utils import safe_schedule_threadsafe
+    from gateway.delivery import (
+        _is_thread_not_found_delivery_error,
+        _looks_like_int,
+        _send_result_failed,
+        looks_like_telegram_private_chat_id,
+    )
     from gateway.platforms.base import BasePlatformAdapter, should_send_media_as_audio
 
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+    media_metadata = metadata
+    route_platform = platform if platform is not None else getattr(adapter, "platform", None)
+    platform_value = getattr(route_platform, "value", route_platform)
+    named_telegram_private_topic_name = None
+    if (
+        platform_value == "telegram"
+        and media_metadata
+        and media_metadata.get("thread_id")
+        and looks_like_telegram_private_chat_id(str(chat_id))
+        and not _looks_like_int(str(media_metadata.get("thread_id")))
+    ):
+        named_telegram_private_topic_name = str(media_metadata["thread_id"])
+
+    def _resolve_named_telegram_private_topic_metadata(force_create: bool = False):
+        if not named_telegram_private_topic_name:
+            return media_metadata
+        ensure_dm_topic = getattr(adapter, "ensure_dm_topic", None)
+        if ensure_dm_topic is None:
+            raise RuntimeError("Telegram adapter cannot create named private DM topics")
+
+        future = safe_schedule_threadsafe(
+            ensure_dm_topic(
+                str(chat_id),
+                named_telegram_private_topic_name,
+                force_create=force_create,
+            ),
+            loop,
+        )
+        if future is None:
+            raise RuntimeError("gateway loop unavailable for Telegram DM topic resolution")
+        try:
+            resolved_thread_id = future.result(timeout=30)
+        except TimeoutError:
+            future.cancel()
+            raise
+        if not resolved_thread_id:
+            raise RuntimeError(
+                f"Failed to resolve Telegram private DM topic '{named_telegram_private_topic_name}'"
+            )
+        resolved_metadata = dict(media_metadata or {})
+        resolved_metadata["thread_id"] = str(resolved_thread_id)
+        resolved_metadata["telegram_dm_topic_created_for_send"] = True
+        return resolved_metadata
+
+    def _run_media_send(coro, media_path):
+        future = safe_schedule_threadsafe(coro, loop)
+        if future is None:
+            logger.warning(
+                "Job '%s': cannot send media %s, gateway loop unavailable",
+                job.get("id", "?"), media_path,
+            )
+            return None
+        try:
+            return future.result(timeout=30)
+        except TimeoutError:
+            future.cancel()
+            raise
+
+    if named_telegram_private_topic_name:
+        try:
+            media_metadata = _resolve_named_telegram_private_topic_metadata()
+        except Exception as e:
+            logger.warning(
+                "Job '%s': failed to resolve Telegram DM topic '%s' for media: %s",
+                job.get("id", "?"),
+                named_telegram_private_topic_name,
+                e,
+            )
+            return
 
     for media_path, _is_voice in media_files:
         try:
             ext = Path(media_path).suffix.lower()
-            route_platform = platform if platform is not None else getattr(adapter, "platform", None)
-            if should_send_media_as_audio(route_platform, ext, is_voice=_is_voice):
-                coro = adapter.send_voice(chat_id=chat_id, audio_path=media_path, metadata=metadata)
-            elif ext in _VIDEO_EXTS:
-                coro = adapter.send_video(chat_id=chat_id, video_path=media_path, metadata=metadata)
-            elif ext in _IMAGE_EXTS:
-                coro = adapter.send_image_file(chat_id=chat_id, image_path=media_path, metadata=metadata)
-            else:
-                coro = adapter.send_document(chat_id=chat_id, file_path=media_path, metadata=metadata)
 
-            from agent.async_utils import safe_schedule_threadsafe
-            future = safe_schedule_threadsafe(coro, loop)
-            if future is None:
-                logger.warning(
-                    "Job '%s': cannot send media %s, gateway loop unavailable",
-                    job.get("id", "?"), media_path,
-                )
+            def _make_coro(current_metadata):
+                if should_send_media_as_audio(route_platform, ext, is_voice=_is_voice):
+                    return adapter.send_voice(chat_id=chat_id, audio_path=media_path, metadata=current_metadata)
+                if ext in _VIDEO_EXTS:
+                    return adapter.send_video(chat_id=chat_id, video_path=media_path, metadata=current_metadata)
+                if ext in _IMAGE_EXTS:
+                    return adapter.send_image_file(chat_id=chat_id, image_path=media_path, metadata=current_metadata)
+                return adapter.send_document(chat_id=chat_id, file_path=media_path, metadata=current_metadata)
+
+            result = _run_media_send(_make_coro(media_metadata), media_path)
+            if result is None:
                 return
-            try:
-                result = future.result(timeout=30)
-            except TimeoutError:
-                future.cancel()
-                raise
-            if result and not getattr(result, "success", True):
+            if (
+                named_telegram_private_topic_name
+                and _send_result_failed(result)
+                and _is_thread_not_found_delivery_error(result)
+            ):
+                media_metadata = _resolve_named_telegram_private_topic_metadata(force_create=True)
+                result = _run_media_send(_make_coro(media_metadata), media_path)
+                if result is None:
+                    return
+            if result and _send_result_failed(result):
+                error = result.get("error") if isinstance(result, dict) else getattr(result, "error", "unknown")
                 logger.warning(
                     "Job '%s': media send failed for %s: %s",
-                    job.get("id", "?"), media_path, getattr(result, "error", "unknown"),
+                    job.get("id", "?"), media_path, error,
                 )
         except Exception as e:
             logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
@@ -1754,6 +1843,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 and looks_like_telegram_private_chat_id(str(chat_id))
                 and _looks_like_int(str(thread_id))
             )
+            is_named_telegram_private_topic = (
+                platform == Platform.TELEGRAM
+                and thread_id is not None
+                and looks_like_telegram_private_chat_id(str(chat_id))
+                and not _looks_like_int(str(thread_id))
+            )
             route_via_dm_topic = is_ambiguous_telegram_topic and _is_channel_dm_topic(
                 runtime_adapter, chat_id, loop, job["id"],
             )
@@ -1779,7 +1874,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # adapter route via a plain message_thread_id.
                 route_thread_id = str(thread_id) if thread_id is not None else None
                 route_metadata = {"job_id": job["id"]}
-                if route_thread_id:
+                if route_thread_id and not is_named_telegram_private_topic:
                     route_metadata["thread_id"] = route_thread_id
                 media_metadata = {"thread_id": thread_id} if thread_id else None
 
@@ -2030,6 +2125,20 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 target_errors.append(msg)
                 delivery_errors.extend(target_errors)
                 continue
+            if platform == Platform.TELEGRAM and thread_id is not None:
+                from gateway.delivery import _looks_like_int, looks_like_telegram_private_chat_id
+                if (
+                    looks_like_telegram_private_chat_id(str(chat_id))
+                    and not _looks_like_int(str(thread_id))
+                ):
+                    msg = (
+                        "named Telegram private DM topic delivery requires the live "
+                        "Telegram adapter; refusing unsafe standalone fallback"
+                    )
+                    logger.error("Job '%s': %s", job["id"], msg)
+                    target_errors.append(msg)
+                    delivery_errors.extend(target_errors)
+                    continue
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
             coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
             try:
