@@ -421,6 +421,9 @@ class AIAgent:
         "[hermes-agent: tool call arguments were corrupted in this session and "
         "have been dropped to keep the conversation alive. See issue #15236.]"
     )
+    _memory_provider_shutdown_condition: threading.Condition
+    _memory_provider_shutdown_state: str
+    _memory_provider_shutdown_owner: int | None
 
     @property
     def base_url(self) -> str:
@@ -4028,24 +4031,50 @@ class AIAgent:
         NOT called per-turn — only at CLI exit, /reset, gateway
         session expiry, etc.
         """
-        if self._memory_manager:
-            try:
-                self._memory_manager.on_session_end(messages or [])
-            except Exception as e:
-                logger.warning("Memory provider on_session_end failed during shutdown: %s", e, exc_info=True)
-            try:
-                self._memory_manager.shutdown_all()
-            except Exception:
-                pass
-        # Notify context engine of session end (flush DAG, close DBs, etc.)
-        if hasattr(self, "context_compressor") and self.context_compressor:
-            try:
-                self.context_compressor.on_session_end(
-                    self.session_id or "",
-                    messages or [],
-                )
-            except Exception:
-                pass
+        if messages is None:
+            messages = list(getattr(self, "_session_messages", []) or [])
+
+        condition = self._memory_provider_shutdown_condition
+        caller = threading.get_ident()
+        with condition:
+            while self._memory_provider_shutdown_state == "in_progress":
+                # A provider callback may synchronously re-enter shutdown on
+                # the owning thread. Returning lets the outer call complete;
+                # waiting here would deadlock it against itself.
+                if self._memory_provider_shutdown_owner == caller:
+                    return
+                condition.wait()
+            if self._memory_provider_shutdown_state == "complete":
+                return
+            self._memory_provider_shutdown_state = "in_progress"
+            self._memory_provider_shutdown_owner = caller
+
+        try:
+            if self._memory_manager:
+                try:
+                    self._memory_manager.on_session_end(messages)
+                except Exception as e:
+                    logger.warning(
+                        "Memory provider on_session_end failed during shutdown: %s", e, exc_info=True
+                    )
+                try:
+                    self._memory_manager.shutdown_all()
+                except Exception:
+                    pass
+            # Notify context engine of session end (flush DAG, close DBs, etc.)
+            if hasattr(self, "context_compressor") and self.context_compressor:
+                try:
+                    self.context_compressor.on_session_end(
+                        self.session_id or "",
+                        messages,
+                    )
+                except Exception:
+                    pass
+        finally:
+            with condition:
+                self._memory_provider_shutdown_state = "complete"
+                self._memory_provider_shutdown_owner = None
+                condition.notify_all()
 
     def commit_memory_session(self, messages: list = None) -> None:
         """Trigger end-of-session extraction without tearing providers down.

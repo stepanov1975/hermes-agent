@@ -774,6 +774,9 @@ def init_agent(
     agent._client_lock = threading.RLock()
     agent._model_request_active = threading.Event()
     agent._supports_active_turn_redirect = True
+    agent._memory_provider_shutdown_condition = threading.Condition()
+    agent._memory_provider_shutdown_state = "not_started"
+    agent._memory_provider_shutdown_owner = None
 
     # /steer mechanism — inject a user note into the next tool result
     # without interrupting the agent. Unlike interrupt(), steer() does
