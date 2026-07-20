@@ -21,6 +21,7 @@ from plugins.memory.hindsight import (
     RECALL_SCHEMA,
     REFLECT_SCHEMA,
     RETAIN_SCHEMA,
+    _BANK_CONFIG_APPLIED_CACHE,
     _load_config,
     _build_embedded_profile_env,
     _normalize_observation_scopes,
@@ -37,7 +38,7 @@ from plugins.memory.hindsight import (
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
-    """Ensure no stale env vars leak between tests."""
+    """Ensure no stale env vars or capability probes leak between tests."""
     for key in (
         "HINDSIGHT_API_KEY", "HINDSIGHT_API_URL", "HINDSIGHT_BANK_ID",
         "HINDSIGHT_BUDGET", "HINDSIGHT_MODE", "HINDSIGHT_TIMEOUT",
@@ -47,6 +48,13 @@ def _clean_env(monkeypatch):
         "HINDSIGHT_RETAIN_USER_PREFIX", "HINDSIGHT_RETAIN_ASSISTANT_PREFIX",
     ):
         monkeypatch.delenv(key, raising=False)
+
+    from plugins.memory import hindsight as hindsight_mod
+    with hindsight_mod._append_capability_lock:
+        hindsight_mod._append_capability_cache.clear()
+    yield
+    with hindsight_mod._append_capability_lock:
+        hindsight_mod._append_capability_cache.clear()
 
 
 def _make_mock_client():
@@ -79,6 +87,10 @@ def _make_mock_client():
         return_value=SimpleNamespace(text="Synthesized answer")
     )
     client.aretain_batch = AsyncMock()
+    client.banks = SimpleNamespace(
+        get_bank_config=AsyncMock(return_value={"config": {}, "overrides": {}}),
+        update_bank_config=AsyncMock(return_value={"ok": True}),
+    )
     client.aclose = AsyncMock()
     return client
 
@@ -198,7 +210,20 @@ def provider_with_config(tmp_path, monkeypatch):
         )
 
         p = HindsightMemoryProvider()
-        p.initialize(session_id="test-session", hermes_home=str(tmp_path), platform="cli")
+        apply_bank_config = HindsightMemoryProvider._apply_configured_bank_config
+        monkeypatch.setattr(
+            HindsightMemoryProvider,
+            "_apply_configured_bank_config",
+            lambda self: None,
+        )
+        try:
+            p.initialize(session_id="test-session", hermes_home=str(tmp_path), platform="cli")
+        finally:
+            monkeypatch.setattr(
+                HindsightMemoryProvider,
+                "_apply_configured_bank_config",
+                apply_bank_config,
+            )
         p._client = _make_mock_client()
         return p
     return _make
@@ -381,6 +406,193 @@ class TestConfig:
         assert p._recall_prompt_preamble == "Custom preamble:"
         assert p._recall_max_input_chars == 500
         assert p._bank_mission == "Test agent mission"
+
+    def test_initialize_applies_configured_bank_config(self, tmp_path, monkeypatch):
+        _BANK_CONFIG_APPLIED_CACHE.clear()
+        config = {
+            "mode": "cloud",
+            "apiKey": "test-key",
+            "api_url": "http://localhost:9999",
+            "bank_id": "test-bank",
+            "budget": "mid",
+            "memory_mode": "hybrid",
+            "bank_mission": " Reflect with Alex's operational context ",
+            "bank_retain_mission": " Extract durable memory facts ",
+        }
+        config_path = tmp_path / "hindsight" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr(
+            "plugins.memory.hindsight.get_hermes_home", lambda: tmp_path
+        )
+
+        client = _make_mock_client()
+        client.banks.get_bank_config.return_value = {
+            "config": {"reflect_mission": None, "retain_mission": None},
+            "overrides": {},
+        }
+        monkeypatch.setattr(
+            HindsightMemoryProvider,
+            "_get_client",
+            lambda self: client,
+        )
+
+        provider = HindsightMemoryProvider()
+        provider.initialize(session_id="test-session", hermes_home=str(tmp_path), platform="cli")
+
+        client.banks.get_bank_config.assert_awaited_once_with(
+            "test-bank",
+            _request_timeout=120,
+        )
+        client.banks.update_bank_config.assert_awaited_once()
+        args, kwargs = client.banks.update_bank_config.await_args
+        assert args[0] == "test-bank"
+        assert args[1].updates == {
+            "reflect_mission": "Reflect with Alex's operational context",
+            "retain_mission": "Extract durable memory facts",
+        }
+        assert kwargs == {"_request_timeout": 120}
+
+    def test_apply_configured_bank_config_patches_changed_config(self, provider):
+        _BANK_CONFIG_APPLIED_CACHE.clear()
+        provider._config["bank_mission"] = " Reflect with Alex's operational context "
+        provider._config["bank_retain_mission"] = " Extract durable memory facts "
+        provider._client.banks.get_bank_config.return_value = {
+            "config": {"reflect_mission": None, "retain_mission": None},
+            "overrides": {},
+        }
+
+        provider._apply_configured_bank_config()
+
+        provider._client.banks.get_bank_config.assert_awaited_once_with(
+            "test-bank",
+            _request_timeout=120,
+        )
+        provider._client.banks.update_bank_config.assert_awaited_once()
+        args, kwargs = provider._client.banks.update_bank_config.await_args
+        assert args[0] == "test-bank"
+        assert args[1].updates == {
+            "reflect_mission": "Reflect with Alex's operational context",
+            "retain_mission": "Extract durable memory facts",
+        }
+        assert kwargs == {"_request_timeout": 120}
+
+    def test_apply_configured_bank_config_skips_when_already_current(self, provider):
+        _BANK_CONFIG_APPLIED_CACHE.clear()
+        provider._config["bank_mission"] = "Reflect with Alex's operational context"
+        provider._config["bank_retain_mission"] = "Extract durable memory facts"
+        provider._client.banks.get_bank_config.return_value = {
+            "config": {
+                "reflect_mission": "Reflect with Alex's operational context",
+                "retain_mission": "Extract durable memory facts",
+            },
+            "overrides": {},
+        }
+
+        provider._apply_configured_bank_config()
+
+        provider._client.banks.get_bank_config.assert_awaited_once_with(
+            "test-bank",
+            _request_timeout=120,
+        )
+        provider._client.banks.update_bank_config.assert_not_awaited()
+
+    def test_apply_configured_bank_config_accepts_generated_response_models(self, provider):
+        _BANK_CONFIG_APPLIED_CACHE.clear()
+
+        class BankConfigModel:
+            def model_dump(self, *, mode):
+                assert mode == "json"
+                return {
+                    "config": {"reflect_mission": None},
+                    "overrides": {},
+                }
+
+        provider._config["bank_mission"] = "Reflect with Alex's operational context"
+        provider._client.banks.get_bank_config.return_value = BankConfigModel()
+
+        provider._apply_configured_bank_config()
+
+        provider._client.banks.update_bank_config.assert_awaited_once()
+        args, kwargs = provider._client.banks.update_bank_config.await_args
+        assert args[0] == "test-bank"
+        assert args[1].updates == {
+            "reflect_mission": "Reflect with Alex's operational context",
+        }
+        assert kwargs == {"_request_timeout": 120}
+
+    def test_apply_configured_bank_config_caches_success_per_auth_context(self, provider):
+        _BANK_CONFIG_APPLIED_CACHE.clear()
+        provider._config["bank_mission"] = "Reflect with Alex's operational context"
+        provider._client.banks.get_bank_config.return_value = {
+            "config": {"reflect_mission": None},
+            "overrides": {},
+        }
+
+        provider._apply_configured_bank_config()
+        provider._apply_configured_bank_config()
+
+        provider._client.banks.get_bank_config.assert_awaited_once()
+        provider._client.banks.update_bank_config.assert_awaited_once()
+
+        provider._api_key = "different-api-key"
+        provider._client.banks.get_bank_config.reset_mock()
+        provider._client.banks.update_bank_config.reset_mock()
+
+        provider._apply_configured_bank_config()
+
+        provider._client.banks.get_bank_config.assert_awaited_once()
+        provider._client.banks.update_bank_config.assert_awaited_once()
+
+    def test_apply_configured_bank_config_clears_explicit_empty_values(self, provider):
+        _BANK_CONFIG_APPLIED_CACHE.clear()
+        provider._config["bank_mission"] = ""
+        provider._config["bank_retain_mission"] = None
+        provider._client.banks.get_bank_config.return_value = {
+            "config": {
+                "reflect_mission": "server default reflect",
+                "retain_mission": "server default retain",
+            },
+            "overrides": {
+                "reflect_mission": "old reflect override",
+                "retain_mission": "old retain override",
+            },
+        }
+
+        provider._apply_configured_bank_config()
+
+        provider._client.banks.update_bank_config.assert_awaited_once()
+        args, kwargs = provider._client.banks.update_bank_config.await_args
+        assert args[0] == "test-bank"
+        assert args[1].updates == {
+            "reflect_mission": None,
+            "retain_mission": None,
+        }
+        assert kwargs == {"_request_timeout": 120}
+
+    def test_apply_configured_bank_config_ignores_absent_keys(self, provider):
+        _BANK_CONFIG_APPLIED_CACHE.clear()
+        provider._config.pop("bank_mission", None)
+        provider._config.pop("bank_retain_mission", None)
+        provider._client.banks.get_bank_config.return_value = {
+            "config": {"reflect_mission": "server default"},
+            "overrides": {"reflect_mission": "old override"},
+        }
+
+        provider._apply_configured_bank_config()
+
+        provider._client.banks.get_bank_config.assert_not_awaited()
+        provider._client.banks.update_bank_config.assert_not_awaited()
+
+    def test_apply_configured_bank_config_failure_is_nonfatal(self, provider, caplog):
+        _BANK_CONFIG_APPLIED_CACHE.clear()
+        provider._config["bank_mission"] = "Reflect with Alex's operational context"
+        provider._client.banks.get_bank_config.side_effect = RuntimeError("bank API down")
+
+        provider._apply_configured_bank_config()
+
+        provider._client.banks.update_bank_config.assert_not_awaited()
+        assert "Failed to apply configured Hindsight bank config" in caplog.text
 
     def test_config_from_env_fallback(self, tmp_path, monkeypatch):
         """When no config file exists, falls back to env vars."""
@@ -970,8 +1182,8 @@ class TestSyncTurn:
         assert item["metadata"]["turn_index"] == "3"
         assert item["metadata"]["message_count"] == "6"
 
-    def test_sync_turn_accumulates_full_session_without_append_support(self, provider_with_config):
-        """Legacy/overwrite APIs (no update_mode=append) resend the ENTIRE session each retain."""
+    def test_sync_turn_accumulates_full_session(self, provider_with_config):
+        """Each retain sends the ENTIRE session, not just the latest batch."""
         p = provider_with_config(retain_every_n_turns=2)
 
         p.sync_turn("turn1-user", "turn1-asst")
@@ -985,58 +1197,11 @@ class TestSyncTurn:
         p._retain_queue.join()
 
         content = p._client.aretain_batch.call_args.kwargs["items"][0]["content"]
-        # Without append support the document is overwritten, so it must
-        # contain ALL turns from the session.
+        # Should contain ALL turns from the session
         assert "turn1-user" in content
         assert "turn2-user" in content
         assert "turn3-user" in content
         assert "turn4-user" in content
-
-    def test_sync_turn_appends_only_delta_when_append_supported(self, provider_with_config, monkeypatch):
-        """On append-capable APIs each retain ships only the new turns, not the whole session."""
-        monkeypatch.setattr(
-            "plugins.memory.hindsight._fetch_hindsight_api_version",
-            lambda *a, **kw: "0.5.6",
-        )
-        from plugins.memory.hindsight import _append_capability_cache, _append_capability_lock
-        # Clear before AND after: the capability cache is module-global and keyed
-        # per api_url, so a stale entry would leak into other tests.
-        with _append_capability_lock:
-            _append_capability_cache.clear()
-        try:
-            p = provider_with_config(retain_every_n_turns=2)
-
-            p.sync_turn("turn1-user", "turn1-asst")
-            p.sync_turn("turn2-user", "turn2-asst")
-            p._retain_queue.join()
-
-            first = p._client.aretain_batch.call_args.kwargs
-            first_item = first["items"][0]
-            assert first["document_id"] == "test-session"
-            assert first_item["update_mode"] == "append"
-            assert "turn1-user" in first_item["content"]
-            assert "turn2-user" in first_item["content"]
-
-            p._client.aretain_batch.reset_mock()
-
-            p.sync_turn("turn3-user", "turn3-asst")
-            p.sync_turn("turn4-user", "turn4-asst")
-            p._retain_queue.join()
-
-            second = p._client.aretain_batch.call_args.kwargs
-            second_item = second["items"][0]
-            assert second["document_id"] == "test-session"
-            assert second_item["update_mode"] == "append"
-            # Only the delta — the already-retained turns must NOT be resent.
-            assert "turn1-user" not in second_item["content"]
-            assert "turn2-user" not in second_item["content"]
-            assert "turn3-user" in second_item["content"]
-            assert "turn4-user" in second_item["content"]
-            # message_count reflects only the delta (2 turns -> 4 messages).
-            assert second_item["metadata"]["message_count"] == "4"
-        finally:
-            with _append_capability_lock:
-                _append_capability_cache.clear()
 
     def test_sync_turn_passes_document_id(self, provider):
         """sync_turn should pass document_id (session_id + per-startup ts)."""
@@ -1179,6 +1344,36 @@ class TestShutdownRace:
         # Both retains drained before shutdown returned.
         assert client.aretain_batch.call_count == 2
         assert provider._retain_queue.empty()
+
+    def test_session_end_flushes_buffered_partial_retain_batch(self, provider_with_config):
+        """Session finalization must persist a partial retain_every_n buffer.
+
+        With retain_every_n_turns > 1, the last one or two turns may be
+        buffered but not yet enqueued when the CLI exits. ``on_session_end``
+        must enqueue those turns before ``shutdown`` closes the writer/client.
+        """
+        p = provider_with_config(retain_every_n_turns=3, retain_async=False)
+        client = p._client
+        p.sync_turn("last-user", "last-asst")
+        assert p._sync_thread is None
+        client.aretain_batch.assert_not_called()
+
+        p.on_session_end([{"role": "user", "content": "last-user"}])
+        p.shutdown()
+
+        client.aretain_batch.assert_called_once()
+        kw = client.aretain_batch.call_args.kwargs
+        assert kw["document_id"] == p._document_id
+        assert kw["retain_async"] is False
+        item = kw["items"][0]
+        content = json.loads(item["content"])
+        assert len(content) == 1
+        assert content[0][0]["content"] == "User: last-user"
+        assert content[0][1]["content"] == "Assistant: last-asst"
+        assert "session:test-session" in item["tags"]
+        assert item["metadata"]["session_id"] == "test-session"
+        assert item["metadata"]["message_count"] == "2"
+        assert item["metadata"]["turn_index"] == "1"
 
     def test_shutdown_is_idempotent(self, provider):
         provider.sync_turn("a", "b")
@@ -1376,6 +1571,183 @@ class TestUpdateModeAppendCapability:
         assert kw["document_id"] == "test-session"
         item = kw["items"][0]
         assert item["update_mode"] == "append"
+
+    def test_modern_api_append_retains_delta_at_boundaries(self, provider_with_config, monkeypatch):
+        """Append-mode boundaries must not resend turns already appended."""
+        self._clear_capability_cache()
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._fetch_hindsight_api_version",
+            lambda *a, **kw: "0.5.6",
+        )
+        p = provider_with_config(retain_every_n_turns=3, retain_async=False)
+
+        for idx in range(1, 4):
+            p.sync_turn(f"turn{idx}-user", f"turn{idx}-asst")
+        p._retain_queue.join()
+        first_item = p._client.aretain_batch.call_args.kwargs["items"][0]
+        first_content = json.loads(first_item["content"])
+        assert len(first_content) == 3
+        assert first_content[0][0]["content"] == "User: turn1-user"
+
+        p._client.aretain_batch.reset_mock()
+        for idx in range(4, 7):
+            p.sync_turn(f"turn{idx}-user", f"turn{idx}-asst")
+        p._retain_queue.join()
+
+        kw = p._client.aretain_batch.call_args.kwargs
+        assert kw["document_id"] == "test-session"
+        item = kw["items"][0]
+        assert item["update_mode"] == "append"
+        content = json.loads(item["content"])
+        assert len(content) == 3
+        assert content[0][0]["content"] == "User: turn4-user"
+        assert "turn1-user" not in item["content"]
+
+    def test_modern_api_append_retries_failed_boundary_on_next_retain(
+        self, provider_with_config, monkeypatch
+    ):
+        """A failed append retain must not advance the retry high-water mark."""
+        self._clear_capability_cache()
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._fetch_hindsight_api_version",
+            lambda *a, **kw: "0.5.6",
+        )
+        p = provider_with_config(retain_every_n_turns=3, retain_async=False)
+        p._client.aretain_batch.side_effect = [RuntimeError("network error"), None]
+
+        for idx in range(1, 4):
+            p.sync_turn(f"turn{idx}-user", f"turn{idx}-asst")
+        p._retain_queue.join()
+        assert p._last_enqueued_turn_count == 0
+
+        for idx in range(4, 7):
+            p.sync_turn(f"turn{idx}-user", f"turn{idx}-asst")
+        p._retain_queue.join()
+
+        assert p._client.aretain_batch.call_count == 2
+        item = p._client.aretain_batch.call_args.kwargs["items"][0]
+        assert item["update_mode"] == "append"
+        content = json.loads(item["content"])
+        assert len(content) == 6
+        assert content[0][0]["content"] == "User: turn1-user"
+        assert content[-1][0]["content"] == "User: turn6-user"
+
+    def test_modern_api_append_failure_during_immediate_drain_rolls_back_reservation(
+        self, provider_with_config, monkeypatch
+    ):
+        """Reserve-before-enqueue must survive a writer that drains immediately."""
+        self._clear_capability_cache()
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._fetch_hindsight_api_version",
+            lambda *a, **kw: "0.5.6",
+        )
+        p = provider_with_config(retain_every_n_turns=1, retain_async=False)
+        p._client.aretain_batch.side_effect = RuntimeError("network error")
+        p._ensure_writer = lambda: None
+
+        class _ImmediateQueue:
+            def put(self, job):
+                try:
+                    job()
+                except RuntimeError:
+                    pass
+
+            def join(self):
+                pass
+
+        p._retain_queue = _ImmediateQueue()
+        p.sync_turn("turn1-user", "turn1-asst")
+
+        assert p._last_enqueued_turn_count == 0
+        assert p._append_enqueued_count("test-session") == 0
+        assert p._append_retained_count("test-session") == 0
+
+    def test_modern_api_session_end_retries_failed_exact_boundary_append(
+        self, provider_with_config, monkeypatch
+    ):
+        """Finalization must retry an exact-boundary append that failed earlier."""
+        self._clear_capability_cache()
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._fetch_hindsight_api_version",
+            lambda *a, **kw: "0.5.6",
+        )
+        p = provider_with_config(retain_every_n_turns=3, retain_async=False)
+        p._client.aretain_batch.side_effect = [RuntimeError("network error"), None]
+
+        for idx in range(1, 4):
+            p.sync_turn(f"turn{idx}-user", f"turn{idx}-asst")
+        p._retain_queue.join()
+        assert p._client.aretain_batch.call_count == 1
+        assert p._append_retained_count("test-session") == 0
+
+        p.on_session_end([])
+        p._retain_queue.join()
+
+        assert p._client.aretain_batch.call_count == 2
+        item = p._client.aretain_batch.call_args.kwargs["items"][0]
+        content = json.loads(item["content"])
+        assert len(content) == 3
+        assert content[0][0]["content"] == "User: turn1-user"
+        assert content[-1][0]["content"] == "User: turn3-user"
+
+    def test_modern_api_session_end_flushes_only_append_remainder(
+        self, provider_with_config, monkeypatch
+    ):
+        """Final partial flush should append only turns not retained earlier."""
+        self._clear_capability_cache()
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._fetch_hindsight_api_version",
+            lambda *a, **kw: "0.5.6",
+        )
+        p = provider_with_config(retain_every_n_turns=3, retain_async=False)
+
+        for idx in range(1, 4):
+            p.sync_turn(f"turn{idx}-user", f"turn{idx}-asst")
+        p._retain_queue.join()
+        p._client.aretain_batch.reset_mock()
+
+        p.sync_turn("turn4-user", "turn4-asst")
+        p.on_session_end([])
+        p._retain_queue.join()
+
+        kw = p._client.aretain_batch.call_args.kwargs
+        assert kw["document_id"] == "test-session"
+        item = kw["items"][0]
+        assert item["update_mode"] == "append"
+        content = json.loads(item["content"])
+        assert len(content) == 1
+        assert content[0][0]["content"] == "User: turn4-user"
+        assert content[0][1]["content"] == "Assistant: turn4-asst"
+        assert "turn1-user" not in item["content"]
+
+    def test_modern_api_session_switch_flushes_only_append_remainder(
+        self, provider_with_config, monkeypatch
+    ):
+        """Session switch append flush should not duplicate earlier boundaries."""
+        self._clear_capability_cache()
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._fetch_hindsight_api_version",
+            lambda *a, **kw: "0.5.6",
+        )
+        p = provider_with_config(retain_every_n_turns=3, retain_async=False)
+
+        for idx in range(1, 4):
+            p.sync_turn(f"turn{idx}-user", f"turn{idx}-asst")
+        p._retain_queue.join()
+        p._client.aretain_batch.reset_mock()
+
+        p.sync_turn("turn4-user", "turn4-asst")
+        p.on_session_switch("new-sid", parent_session_id="test-session", reset=True)
+        p._retain_queue.join()
+
+        kw = p._client.aretain_batch.call_args.kwargs
+        assert kw["document_id"] == "test-session"
+        item = kw["items"][0]
+        assert item["update_mode"] == "append"
+        content = json.loads(item["content"])
+        assert len(content) == 1
+        assert content[0][0]["content"] == "User: turn4-user"
+        assert "turn1-user" not in item["content"]
 
     def test_capability_cached_per_url(self, provider, monkeypatch):
         """The /version probe must run at most once per (process, api_url)."""

@@ -413,6 +413,11 @@ class CLIAgentSetupMixin:
             # forever — so memory shutdown never ran on /exit (#49287).
             import cli as _cli
             _cli._active_agent_ref = self.agent
+            setattr(
+                self.agent,
+                "_skip_memory_prefetch_after_turn",
+                bool(getattr(self, "_skip_memory_prefetch_after_turn", False)),
+            )
             # Route agent status output through prompt_toolkit so ANSI escape
             # sequences aren't garbled by patch_stdout's StdoutProxy (#2262).
             self.agent._print_fn = _cprint

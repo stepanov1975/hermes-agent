@@ -15905,6 +15905,7 @@ def main(
                 # Only print the final response and parseable session info.
                 cli.tool_progress_mode = "off"
                 if cli._ensure_runtime_credentials():
+                    setattr(cli, "_skip_memory_prefetch_after_turn", True)
                     effective_query: Any = query
                     if single_query_images or single_query_image_urls:
                         # Honour the same image-routing decision used by the
@@ -16073,6 +16074,7 @@ def main(
                 # Surface security advisories before the agent runs — short
                 # banner, doesn't depend on the welcome banner being shown.
                 cli._show_security_advisories()
+                setattr(cli, "_skip_memory_prefetch_after_turn", True)
                 cli.chat(query, images=single_query_images or None)
                 cli._print_exit_summary(clear_screen=False)
         finally:
