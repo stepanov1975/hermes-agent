@@ -1073,7 +1073,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "recall_tags", "description": "Tags to filter when searching memories (comma-separated)", "default": ""},
             {"key": "recall_tags_match", "description": "Tag matching mode for recall", "default": "any", "choices": ["any", "all", "any_strict", "all_strict"]},
             {"key": "recall_types", "description": "Fact types to surface on recall — applies to both auto-recall and the hindsight_recall tool (comma-separated or list). Defaults to observation-only — observations are Hindsight's consolidated, deduplicated, evidence-grounded knowledge layer; raw world/experience facts are the supporting evidence observations already summarize. Set to e.g. 'observation,world,experience' to also include raw facts.", "default": "observation"},
-            {"key": "auto_recall", "description": "Automatically recall memories before each turn", "default": True},
+            {"key": "auto_recall", "description": "Enable automatic memory-context injection", "default": True},
             {"key": "recall_sync", "description": "Recall synchronously against the current message before each turn (higher relevance, adds recall latency to the turn). Default off: recall runs in the background and is injected on the next turn.", "default": False},
             {"key": "auto_retain", "description": "Automatically retain conversation turns", "default": True},
             {"key": "retain_every_n_turns", "description": "Retain every N turns (1 = every turn)", "default": 1},
@@ -1702,11 +1702,11 @@ class HindsightMemoryProvider(MemoryProvider):
         return False
 
     def _do_recall(self, query: str) -> str:
-        """Run one recall/reflect for *query* and return the formatted memory
-        text (empty on error or no results).
+        """Run one recall/reflect for *query* and return raw memory text.
 
         Shared by the background prefetch worker (``queue_prefetch``) and the
         opt-in synchronous path (``prefetch`` when ``recall_sync`` is enabled).
+        Returns an empty string on error or when no results are available.
         """
         # Truncate query to max chars
         if self._recall_max_input_chars and len(query) > self._recall_max_input_chars:

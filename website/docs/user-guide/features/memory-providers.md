@@ -427,7 +427,8 @@ The setup wizard installs dependencies automatically and only installs what's ne
 | `recall_budget` | `mid` | Recall thoroughness: `low` / `mid` / `high` |
 | `memory_mode` | `hybrid` | `hybrid` (context + tools), `context` (auto-inject only), `tools` (tools only) |
 | `auto_retain` | `true` | Automatically retain conversation turns |
-| `auto_recall` | `true` | Automatically recall memories before each turn |
+| `auto_recall` | `true` | Enable automatic memory-context injection (`recall_sync` controls when recall runs) |
+| `recall_sync` | `false` | Recall against the current user message before the turn. Adds recall latency, but avoids an empty first turn and previous-turn context. |
 | `retain_async` | `true` | Process retain asynchronously on the server |
 | `retain_context` | `conversation between Hermes Agent and the User` | Context label for retained memories |
 | `retain_tags` | — | Default tags applied to retained memories; merged with per-call tool tags |
