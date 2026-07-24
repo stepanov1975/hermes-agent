@@ -825,15 +825,42 @@ class TestPrefetch:
         assert p._prefetch_result == ""
         result = p.prefetch("fix tests")
 
-        assert captured["query"] == "fix tests"       # current query, not ignored
+        assert captured["query"] == "fix tests"  # current query, not ignored
         assert "fresh memory" in result
-        p._client.arecall.assert_called_once()
+        p._client.arecall.assert_awaited_once()
 
     def test_recall_sync_skips_background_queue(self, provider_with_config):
         # With sync recall there's nothing to prime in the background.
         p = provider_with_config(recall_sync=True)
         p.queue_prefetch("anything")
         assert p._prefetch_thread is None
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"auto_recall": False},
+            {"memory_mode": "tools"},
+        ],
+    )
+    def test_recall_sync_respects_auto_injection_guards(
+        self, provider_with_config, overrides
+    ):
+        p = provider_with_config(recall_sync=True, **overrides)
+
+        assert p.prefetch("current query") == ""
+        p._client.arecall.assert_not_called()
+
+    def test_recall_sync_supports_reflect_prefetch(self, provider_with_config):
+        p = provider_with_config(
+            recall_sync=True,
+            recall_prefetch_method="reflect",
+        )
+
+        result = p.prefetch("current query")
+
+        assert "Synthesized answer" in result
+        p._client.areflect.assert_awaited_once()
+        assert p._client.areflect.call_args.kwargs["query"] == "current query"
 
     def test_async_default_ignores_current_query_and_reads_buffer(self, provider):
         # Default (recall_sync off): prefetch returns the buffered result and
@@ -1504,6 +1531,11 @@ class TestSystemPrompt:
 
 
 class TestConfigSchema:
+    def test_recall_sync_is_exposed_disabled_by_default(self, provider):
+        schema = {field["key"]: field for field in provider.get_config_schema()}
+
+        assert schema["recall_sync"]["default"] is False
+
     def test_schema_has_all_new_fields(self, provider):
         schema = provider.get_config_schema()
         keys = {f["key"] for f in schema}
