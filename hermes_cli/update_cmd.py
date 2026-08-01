@@ -3474,8 +3474,32 @@ def _normalize_managed_eol(git_cmd, repo_root):
             return None
         return {p for p in out.stdout.split("\0") if p}
 
+    def _numstat_dirty(*extra):
+        # ``--name-only`` reports a path before whitespace filters are applied
+        # on Git 2.43, so it still lists CRLF-only changes with
+        # ``--ignore-cr-at-eol``. ``--numstat`` omits file pairs whose filtered
+        # diff is empty. Disable rename detection to keep the NUL-delimited
+        # format at one self-contained record per path.
+        out = subprocess.run(
+            probe + ["diff", "--numstat", "-z", "--no-renames", *extra],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if out.returncode != 0:
+            return None
+        paths = set()
+        for record in out.stdout.split("\0"):
+            fields = record.split("\t", 2)
+            if len(fields) == 3 and fields[2]:
+                paths.add(fields[2])
+        return paths
+
     def _eol_only():
-        all_dirty, real_dirty = _dirty(), _dirty("--ignore-cr-at-eol")
+        all_dirty = _dirty()
+        real_dirty = _numstat_dirty("--ignore-cr-at-eol")
         if all_dirty is None or real_dirty is None:
             return None
         return all_dirty - real_dirty
