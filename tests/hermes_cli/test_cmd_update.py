@@ -1,13 +1,19 @@
 """Tests for cmd_update — branch fallback when remote branch doesn't exist."""
 
+import argparse
 import hashlib
+import shlex
 import subprocess
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
+from hermes_cli import config as hermes_config
+from hermes_cli import main as hermes_main
+from hermes_cli import update_cmd as hermes_update_cmd
 from hermes_cli.main import cmd_update, PROJECT_ROOT
+from hermes_cli.subcommands.update import build_update_parser
 
 
 def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0"):
@@ -753,3 +759,379 @@ class TestNodeRuntimeNpmResolution:
             not call.args or not call.args[0] or call.args[0][0] != windows_npm
             for call in mock_run.call_args_list
         )
+
+
+def _git(cwd, *args):
+    return subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+@pytest.fixture
+def tagged_remote(tmp_path):
+    """A real origin with an annotated release tag behind main."""
+    origin = tmp_path / "origin.git"
+    seed = tmp_path / "seed"
+    checkout = tmp_path / "checkout"
+    _git(tmp_path, "init", "--bare", "-q", origin)
+    _git(tmp_path, "init", "-q", "-b", "main", seed)
+    _git(seed, "config", "user.email", "test@example.com")
+    _git(seed, "config", "user.name", "Test User")
+
+    tracked = seed / "tracked.txt"
+    tracked.write_text("release\n", encoding="utf-8")
+    _git(seed, "add", "tracked.txt")
+    _git(seed, "commit", "-qm", "release")
+    tag_sha = _git(seed, "rev-parse", "HEAD").stdout.strip()
+    tag = "v2026.7.30"
+    _git(seed, "tag", "-a", tag, "-m", "release tag")
+    extra_tags = ("unrelated", "-release", "release;reboot")
+    for extra_tag in extra_tags:
+        _git(seed, "update-ref", f"refs/tags/{extra_tag}", tag_sha)
+    tree_sha = _git(seed, "rev-parse", "HEAD^{tree}").stdout.strip()
+    tree_tag = "tree-only"
+    _git(seed, "update-ref", f"refs/tags/{tree_tag}", tree_sha)
+
+    tracked.write_text("main\n", encoding="utf-8")
+    _git(seed, "commit", "-qam", "main moved")
+    main_sha = _git(seed, "rev-parse", "HEAD").stdout.strip()
+    _git(seed, "remote", "add", "origin", str(origin))
+    _git(seed, "push", "-q", "origin", "main", "--tags")
+    _git(origin, "symbolic-ref", "HEAD", "refs/heads/main")
+    _git(tmp_path, "clone", "-q", "--no-tags", origin, checkout)
+    # `clone --no-tags` persists remote.origin.tagOpt. Clear it so these tests
+    # prove that each updater fetch supplies its own explicit `--no-tags`.
+    _git(checkout, "config", "--unset", "remote.origin.tagOpt")
+    return SimpleNamespace(
+        checkout=checkout,
+        tag=tag,
+        tag_sha=tag_sha,
+        main_sha=main_sha,
+        extra_tags=extra_tags,
+        tree_tag=tree_tag,
+    )
+
+
+def _update_parser():
+    parser = argparse.ArgumentParser(prog="hermes")
+    subparsers = parser.add_subparsers(dest="command")
+    build_update_parser(subparsers, cmd_update=lambda _args: None)
+    return parser
+
+
+def test_update_tag_parser_is_mutually_exclusive_with_branch():
+    parser = _update_parser()
+
+    args = parser.parse_args(["update", "--tag", "v2026.7.30"])
+    assert args.tag == "v2026.7.30"
+    assert args.branch is None
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["update", "--branch", "main", "--tag", "v2026.7.30"]
+        )
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["hermes", "update", "--tag=release&whoami"],
+        ["git", "checkout", "topic's;branch"],
+        ["hermes", "update", "--tag=-release"],
+    ],
+)
+def test_format_shell_command_posix_round_trips(argv):
+    rendered = hermes_update_cmd._format_shell_command(argv, windows=False)
+
+    assert shlex.split(rendered) == argv
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (
+            ["hermes", "update", "--tag=release&whoami"],
+            "& 'hermes' 'update' '--tag=release&whoami'",
+        ),
+        (
+            ["git", "checkout", "topic's;branch"],
+            "& 'git' 'checkout' 'topic''s;branch'",
+        ),
+        (
+            ["hermes", "update", "--tag=-release"],
+            "& 'hermes' 'update' '--tag=-release'",
+        ),
+    ],
+)
+def test_format_shell_command_uses_powershell_quoting(argv, expected):
+    assert hermes_update_cmd._format_shell_command(argv, windows=True) == expected
+
+
+def test_update_check_tag_uses_exact_annotated_tag(
+    tagged_remote, monkeypatch, capsys
+):
+    checkout = tagged_remote.checkout
+    tag = tagged_remote.tag
+    tag_sha = tagged_remote.tag_sha
+    monkeypatch.setattr(hermes_main, "PROJECT_ROOT", checkout)
+
+    hermes_main._cmd_update_check(tag=tag)
+    output = capsys.readouterr().out
+    assert f"Run: hermes update --tag={tag}" in output
+    assert _git(checkout, "rev-parse", f"refs/tags/{tag}^{{commit}}").stdout.strip() == tag_sha
+    assert set(_git(checkout, "tag", "--list").stdout.splitlines()) == {tag}
+
+    _git(checkout, "checkout", "-q", "--detach", f"refs/tags/{tag}^{{commit}}")
+    hermes_main._cmd_update_check(tag=tag)
+    assert f"Already at tag '{tag}'" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("tag", "expected_command"),
+    [
+        ("-release", "Run: hermes update --tag=-release"),
+        ("release;reboot", "Run: hermes update '--tag=release;reboot'"),
+    ],
+)
+def test_update_check_tag_quotes_copyable_command(
+    tagged_remote, monkeypatch, capsys, tag, expected_command
+):
+    monkeypatch.setattr(hermes_main, "PROJECT_ROOT", tagged_remote.checkout)
+
+    hermes_main._cmd_update_check(tag=tag)
+
+    assert expected_command in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("tag", "message"),
+    [
+        ("*", "Invalid Git tag name"),
+        ("missing", "Failed to fetch tag"),
+        ("tree-only", "does not identify a commit"),
+    ],
+)
+def test_update_check_tag_failures_do_not_change_checkout(
+    tagged_remote, monkeypatch, capsys, tag, message
+):
+    checkout = tagged_remote.checkout
+    monkeypatch.setattr(hermes_main, "PROJECT_ROOT", checkout)
+
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main._cmd_update_check(tag=tag)
+
+    assert message in capsys.readouterr().out
+    assert _git(checkout, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == "main"
+    assert _git(checkout, "rev-parse", "HEAD").stdout.strip() == tagged_remote.main_sha
+    expected_tags = {tag} if tag == tagged_remote.tree_tag else set()
+    assert set(_git(checkout, "tag", "--list").stdout.splitlines()) == expected_tags
+
+
+def test_resolve_update_tag_commit_handles_annotated_lightweight_and_non_commit(
+    tmp_path,
+):
+    _git(tmp_path, "init", "-q")
+    _git(tmp_path, "config", "user.email", "test@example.com")
+    _git(tmp_path, "config", "user.name", "Test User")
+    (tmp_path / "tracked.txt").write_text("content\n", encoding="utf-8")
+    _git(tmp_path, "add", "tracked.txt")
+    _git(tmp_path, "commit", "-qm", "initial")
+    commit_sha = _git(tmp_path, "rev-parse", "HEAD").stdout.strip()
+    _git(tmp_path, "tag", "lightweight")
+    _git(tmp_path, "tag", "-a", "annotated", "-m", "annotated")
+    tree_sha = _git(tmp_path, "rev-parse", "HEAD^{tree}").stdout.strip()
+    _git(tmp_path, "tag", "tree-only", tree_sha)
+
+    assert (
+        hermes_update_cmd._resolve_update_tag_commit(
+            ["git"], tmp_path, "lightweight"
+        )
+        == commit_sha
+    )
+    assert (
+        hermes_update_cmd._resolve_update_tag_commit(
+            ["git"], tmp_path, "annotated"
+        )
+        == commit_sha
+    )
+    assert (
+        hermes_update_cmd._resolve_update_tag_commit(
+            ["git"], tmp_path, "tree-only"
+        )
+        is None
+    )
+
+
+def _patch_tag_update_preamble(monkeypatch, checkout):
+    monkeypatch.setattr(hermes_main, "PROJECT_ROOT", checkout)
+    monkeypatch.setattr(hermes_main, "_is_windows", lambda: False)
+    monkeypatch.setattr(hermes_main, "_run_pre_update_backup", lambda _args: None)
+    monkeypatch.setattr(hermes_main, "_pause_windows_gateways_for_update", lambda: None)
+    monkeypatch.setattr(
+        hermes_main,
+        "_get_origin_url",
+        lambda *_args: "https://github.com/NousResearch/hermes-agent.git",
+    )
+    monkeypatch.setattr(hermes_config, "load_config", lambda: {})
+    monkeypatch.setattr(
+        hermes_update_cmd, "_discard_lockfile_churn", lambda *_args: None
+    )
+    monkeypatch.setattr(
+        hermes_update_cmd, "_normalize_managed_eol", lambda *_args: None
+    )
+
+
+@pytest.mark.parametrize(
+    ("start_detached", "dirty", "branch_at_tag"),
+    [
+        (False, False, False),
+        (True, False, False),
+        (False, True, False),
+        (False, False, True),
+    ],
+)
+def test_update_tag_checkout_and_syntax_rollback_restore_starting_state(
+    tagged_remote, monkeypatch, start_detached, dirty, branch_at_tag
+):
+    checkout = tagged_remote.checkout
+    tag = tagged_remote.tag
+    tag_sha = tagged_remote.tag_sha
+    main_sha = tagged_remote.main_sha
+    assert hasattr(hermes_main, "_resolve_update_target"), "tag target resolver missing"
+    starting_sha = tag_sha if branch_at_tag else main_sha
+    if branch_at_tag:
+        _git(checkout, "reset", "-q", "--hard", tag_sha)
+    if start_detached:
+        _git(checkout, "checkout", "-q", "--detach", starting_sha)
+    if dirty:
+        (checkout / "tracked.txt").write_text("local change\n", encoding="utf-8")
+    _patch_tag_update_preamble(monkeypatch, checkout)
+
+    def fail_after_checkout(_root):
+        assert _git(checkout, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == "HEAD"
+        assert _git(checkout, "rev-parse", "HEAD").stdout.strip() == tag_sha
+        return False, "hermes_cli/main.py", "synthetic syntax failure"
+
+    monkeypatch.setattr(
+        hermes_update_cmd, "_validate_critical_files_syntax", fail_after_checkout
+    )
+
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main._cmd_update_impl(
+            SimpleNamespace(tag=tag, branch=None, no_backup=True),
+            gateway_mode=False,
+        )
+
+    expected_branch = "HEAD" if start_detached else "main"
+    assert (
+        _git(checkout, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+        == expected_branch
+    )
+    assert _git(checkout, "rev-parse", "HEAD").stdout.strip() == starting_sha
+    assert set(_git(checkout, "tag", "--list").stdout.splitlines()) == {tag}
+    if dirty:
+        assert "hermes-update-autostash" in _git(checkout, "stash", "list").stdout
+        assert _git(checkout, "status", "--porcelain").stdout == ""
+
+
+def test_update_tag_failed_rollback_quotes_starting_branch(
+    tagged_remote, monkeypatch, capsys
+):
+    checkout = tagged_remote.checkout
+    branch = "topic's;touch"
+    _git(checkout, "branch", "-m", branch)
+    _patch_tag_update_preamble(monkeypatch, checkout)
+    monkeypatch.setattr(
+        hermes_update_cmd,
+        "_validate_critical_files_syntax",
+        lambda _root: (False, "hermes_cli/main.py", "synthetic syntax failure"),
+    )
+    real_run = subprocess.run
+
+    def fail_rollback(cmd, *args, **kwargs):
+        if cmd[-2:] == ["checkout", branch]:
+            return subprocess.CompletedProcess(
+                cmd, 1, stdout="", stderr="synthetic rollback failure"
+            )
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(hermes_update_cmd.subprocess, "run", fail_rollback)
+
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main._cmd_update_impl(
+            SimpleNamespace(tag=tagged_remote.tag, branch=None, no_backup=True),
+            gateway_mode=False,
+        )
+
+    output = capsys.readouterr().out
+    assert f"From {checkout}, run:" in output
+    assert "git checkout 'topic'\"'\"'s;touch'" in output
+    assert "git checkout topic's;touch" not in output
+
+
+@pytest.mark.parametrize("tag", ["*", "missing", "tree-only"])
+def test_update_tag_failures_happen_before_checkout_or_stash(
+    tagged_remote, monkeypatch, tag
+):
+    checkout = tagged_remote.checkout
+    _patch_tag_update_preamble(monkeypatch, checkout)
+    monkeypatch.setattr(
+        hermes_main,
+        "_stash_local_changes_if_needed",
+        lambda *_args, **_kwargs: pytest.fail("tag failure reached stash"),
+    )
+
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main._cmd_update_impl(
+            SimpleNamespace(tag=tag, branch=None, no_backup=True),
+            gateway_mode=False,
+        )
+
+    assert _git(checkout, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == "main"
+    assert _git(checkout, "rev-parse", "HEAD").stdout.strip() == tagged_remote.main_sha
+
+
+def test_update_tag_is_rejected_for_non_git_install(monkeypatch, capsys):
+    monkeypatch.setattr(hermes_config, "detect_install_method", lambda _root: "uv-tool")
+    monkeypatch.setattr(
+        hermes_main,
+        "_cmd_update_impl",
+        lambda *_args, **_kwargs: pytest.fail("non-Git tag reached updater"),
+    )
+
+    with pytest.raises(SystemExit, match="1"):
+        cmd_update(SimpleNamespace(tag="v2026.7.30", branch=None))
+
+    assert "only supported for Git installations" in capsys.readouterr().out
+
+
+def test_update_empty_tag_is_rejected_before_updater(monkeypatch, capsys):
+    monkeypatch.setattr(hermes_config, "detect_install_method", lambda _root: "git")
+    monkeypatch.setattr(
+        hermes_main,
+        "_cmd_update_impl",
+        lambda *_args, **_kwargs: pytest.fail("empty tag reached updater"),
+    )
+
+    with pytest.raises(SystemExit, match="1"):
+        cmd_update(SimpleNamespace(tag="   ", branch=None))
+
+    assert "requires a non-empty Git tag name" in capsys.readouterr().out
+
+
+def test_update_zip_tag_is_rejected_before_download(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "urllib.request.urlretrieve",
+        lambda *_args: pytest.fail("tag update attempted ZIP download"),
+    )
+
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main._update_via_zip(
+            SimpleNamespace(tag="v2026.7.30", branch=None)
+        )
+
+    assert "--tag is not supported" in capsys.readouterr().out

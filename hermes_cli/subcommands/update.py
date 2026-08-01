@@ -16,8 +16,8 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
     # =========================================================================
     update_parser = subparsers.add_parser(
         "update",
-        help="Update Hermes Agent to the latest version",
-        description="Pull the latest changes from git and reinstall dependencies",
+        help="Update Hermes Agent",
+        description="Update Hermes Agent from git and reinstall dependencies",
     )
     update_parser.add_argument(
         "--gateway",
@@ -50,7 +50,8 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         default=False,
         help="Assume yes for interactive prompts (config migration, stash restore). API-key entry is skipped; run 'hermes config migrate' separately for those.",
     )
-    update_parser.add_argument(
+    target_group = update_parser.add_mutually_exclusive_group()
+    target_group.add_argument(
         "--branch",
         default=None,
         metavar="NAME",
@@ -60,6 +61,12 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
             "switch to the requested branch first (auto-stashing any "
             "uncommitted changes)."
         ),
+    )
+    target_group.add_argument(
+        "--tag",
+        default=None,
+        metavar="TAG",
+        help="Update to this exact Git tag (Git installations only).",
     )
     update_parser.add_argument(
         "--force",

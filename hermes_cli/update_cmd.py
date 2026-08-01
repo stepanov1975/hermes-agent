@@ -724,11 +724,14 @@ def _update_via_zip(args):
 
     # The ZIP fallback exists for Windows git-file-I/O breakage. It pulls a
     # static archive from GitHub, which is fine for the default "main"
-    # channel but would silently ignore --branch and update from main even
-    # if the user asked for something else — exactly the silent-divergence
-    # bug --branch was added to prevent. Refuse to proceed in that case
-    # rather than lie.
-    branch = _m()._resolve_update_branch(args)
+    # channel but cannot honor another branch or an exact tag. Refuse rather
+    # than silently installing main.
+    target_kind, target = _m()._resolve_update_target(args)
+    if target_kind == "tag":
+        print("✗ --tag is not supported by the Windows ZIP-fallback update path.")
+        print("  Repair Git file I/O, then rerun the same tag update.")
+        _m().sys.exit(1)
+    branch = target
     if branch != "main":
         print(
             f"✗ --branch={branch} is not supported on the Windows ZIP-fallback "
@@ -2179,7 +2182,61 @@ def _run_logged_subprocess(cmd, *, cwd=None, env=None):
     _log_only_write(result.stdout or "")
     return result
 
-def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
+
+def _update_tag_ref(tag: str) -> str:
+    return f"refs/tags/{tag}"
+
+
+def _update_tag_refspec(tag: str) -> str:
+    ref = _update_tag_ref(tag)
+    return f"{ref}:{ref}"
+
+
+def _format_shell_command(argv: list[str], *, windows: bool | None = None) -> str:
+    """Render argv for POSIX shells or the documented Windows PowerShell."""
+    if windows is None:
+        windows = _m()._is_windows()
+    if windows:
+        quoted = ("'" + arg.replace("'", "''") + "'" for arg in argv)
+        return "& " + " ".join(quoted)
+    return shlex.join(argv)
+
+
+def _is_valid_update_tag(git_cmd, project_root, tag: str) -> bool:
+    return (
+        subprocess.run(
+            git_cmd + ["check-ref-format", _update_tag_ref(tag)],
+            cwd=project_root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        ).returncode
+        == 0
+    )
+
+
+def _resolve_update_tag_commit(git_cmd, project_root, tag: str) -> str | None:
+    result = subprocess.run(
+        git_cmd
+        + ["rev-parse", "--verify", "--quiet", f"{_update_tag_ref(tag)}^{{commit}}"],
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def _cmd_update_check(
+    branch: str = "main",
+    *,
+    branch_explicit: bool = False,
+    tag: str | None = None,
+):
     """Implement ``hermes update --check``: fetch and report without installing.
 
     ``branch`` selects which branch the check compares against. Default is
@@ -2187,8 +2244,8 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     on origin/<branch>?" without performing the update.
 
     ``branch_explicit`` is True iff the caller passed --branch on the CLI.
-    Installs that can't honor non-default branches (e.g. Docker) surface a
-    one-line notice instead of silently dropping the flag.
+    ``tag`` selects an exact Git tag instead of a branch. Installs that can't
+    honor the selected target surface a notice instead of silently dropping it.
     """
     from hermes_cli.config import detect_install_method, recommended_update_command_for_method
     method = detect_install_method(_m().PROJECT_ROOT)
@@ -2235,6 +2292,61 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
         == "true"
     )
     depth_args = ["--depth", "1"] if is_shallow else []
+
+    tag = (tag or "").strip() or None
+    if tag is not None:
+        if not _is_valid_update_tag(git_cmd, _m().PROJECT_ROOT, tag):
+            print(f"✗ Invalid Git tag name: {tag!r}.")
+            sys.exit(1)
+        print(f"→ Fetching tag '{tag}' from origin...")
+        tag_fetch_result = subprocess.run(
+            git_cmd
+            + ["fetch", "--no-tags"]
+            + depth_args
+            + ["origin", _update_tag_refspec(tag)],
+            cwd=_m().PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if tag_fetch_result.returncode != 0:
+            stderr = tag_fetch_result.stderr.strip()
+            if "Could not resolve host" in stderr or "unable to access" in stderr:
+                print("✗ Network error — cannot reach the remote repository.")
+            elif (
+                "Authentication failed" in stderr
+                or "could not read Username" in stderr
+            ):
+                print(
+                    "✗ Authentication failed — check your git credentials or SSH key."
+                )
+            else:
+                print(f"✗ Failed to fetch tag '{tag}' from origin.")
+                if stderr:
+                    print(f"  {stderr.splitlines()[0]}")
+            sys.exit(1)
+
+        target_sha = _resolve_update_tag_commit(git_cmd, _m().PROJECT_ROOT, tag)
+        if target_sha is None:
+            print(f"✗ Tag '{tag}' does not identify a commit.")
+            sys.exit(1)
+        head_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+        current_branch = subprocess.run(
+            git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=_m().PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        ).stdout.strip()
+        if current_branch == "HEAD" and head_sha == target_sha:
+            print(f"✓ Already at tag '{tag}'.")
+        else:
+            print(f"⚕ Tag '{tag}' differs from the current checkout.")
+            command = _format_shell_command(["hermes", "update", f"--tag={tag}"])
+            print(f"  Run: {command}")
+        return
 
     if branch == "main":
         # Probe locally (~6 ms) whether an 'upstream' remote exists at all
@@ -3727,16 +3839,21 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # Fetch and pull
     try:
 
-        # Resolve the target branch up front so the fetch can be scoped to it.
-        # A bare `git fetch origin` pulls every ref, and this repo carries
-        # thousands of auto-generated branches — an unscoped fetch can stall for
-        # minutes on a non-single-branch checkout. Fetch only what we update
-        # against.
-        branch = _m()._resolve_update_branch(args)
+        # Scope the fetch to the selected branch or exact tag. An unscoped
+        # fetch is expensive because this repository carries many refs.
+        target_kind, target = _m()._resolve_update_target(args)
+        if target_kind == "tag" and not _is_valid_update_tag(
+            git_cmd, _m().PROJECT_ROOT, target
+        ):
+            print(f"✗ Invalid Git tag name: {target!r}.")
+            sys.exit(1)
+        branch = target if target_kind == "branch" else "main"
+        fetch_ref = target if target_kind == "branch" else _update_tag_refspec(target)
 
         print("→ Fetching updates...")
+        fetch_options = ["--no-tags"] if target_kind == "tag" else []
         fetch_result = subprocess.run(
-            git_cmd + ["fetch", "origin", branch],
+            git_cmd + ["fetch"] + fetch_options + ["origin", fetch_ref],
             cwd=_m().PROJECT_ROOT,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
@@ -3752,6 +3869,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 print(
                     "✗ Authentication failed — check your git credentials or SSH key."
                 )
+            elif target_kind == "tag":
+                print(f"✗ Failed to fetch tag '{target}' from origin.")
+                if stderr:
+                    print(f"  {stderr.splitlines()[0]}")
             else:
                 print("✗ Failed to fetch updates from origin.")
                 if stderr:
@@ -3767,13 +3888,19 @@ def _cmd_update_impl(args, gateway_mode: bool):
             check=True,
         )
         current_branch = result.stdout.strip()
+        target_sha = ""
+        if target_kind == "tag":
+            resolved_tag_sha = _resolve_update_tag_commit(
+                git_cmd, _m().PROJECT_ROOT, target
+            )
+            if resolved_tag_sha is None:
+                print(f"✗ Tag '{target}' does not identify a commit.")
+                sys.exit(1)
+            target_sha = resolved_tag_sha
 
-        # If user is on a different branch than the update target, switch
-        # to the target. When the target is "main" this is the historical
-        # "always update against main" behavior; for any other target it's
-        # the same thing — get HEAD onto the requested branch first, then
-        # fast-forward.
-        if current_branch != branch:
+        # Branch targets keep the historical behavior: switch to the selected
+        # branch before checking behindness, then fast-forward it.
+        if target_kind == "branch" and current_branch != branch:
             label = (
                 "detached HEAD"
                 if current_branch == "HEAD"
@@ -3823,21 +3950,26 @@ def _cmd_update_impl(args, gateway_mode: bool):
             and (gateway_mode or (sys.stdin.isatty() and sys.stdout.isatty()))
         )
 
-        # Check if there are updates
-        result = subprocess.run(
-            git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
-            cwd=_m().PROJECT_ROOT,
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-            check=True,
-        )
-        commit_count = int(result.stdout.strip())
+        # Branches count commits behind; tags require both the exact commit and
+        # detached-HEAD identity so an attached branch at that commit is pinned.
+        if target_kind == "tag":
+            head_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+            commit_count = int(current_branch != "HEAD" or head_sha != target_sha)
+        else:
+            result = subprocess.run(
+                git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
+                cwd=_m().PROJECT_ROOT,
+                capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+                check=True,
+            )
+            commit_count = int(result.stdout.strip())
 
         if commit_count == 0:
             _invalidate_update_cache()
 
             # Even if origin is up to date, the fork may be behind upstream
-            if is_fork and branch == "main":
+            if target_kind == "branch" and is_fork and branch == "main":
                 _m()._sync_with_upstream_if_needed(git_cmd, _m().PROJECT_ROOT)
 
             # Restore stash and switch back to original branch if we moved
@@ -3849,7 +3981,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     prompt_user=prompt_for_restore,
                     input_fn=gw_input_fn,
                 )
-            if current_branch not in {branch, "HEAD"}:
+            if target_kind == "branch" and current_branch not in {branch, "HEAD"}:
                 subprocess.run(
                     git_cmd + ["checkout", current_branch],
                     cwd=_m().PROJECT_ROOT,
@@ -3934,9 +4066,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
             _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
             return
 
-        print(f"→ Found {commit_count} new commit(s)")
-
-        print("→ Pulling updates...")
+        if target_kind == "tag":
+            print(f"→ Checking out tag '{target}'...")
+        else:
+            print(f"→ Found {commit_count} new commit(s)")
+            print("→ Pulling updates...")
         update_succeeded = False
         # Capture the pre-pull SHA so we can auto-roll-back if the new code
         # has a syntax error in a critical-path file (PR #28452 incident:
@@ -3945,39 +4079,55 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # the bad commit and the fix landing).
         pre_pull_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
         try:
-            # Merge the ref we already fetched above (→ Fetching updates...)
-            # instead of `git pull`, which performs a SECOND network fetch of
-            # the same branch (~0.5-1.5 s of redundant round-trip per update).
-            # `merge --ff-only origin/<branch>` is byte-identical in effect to
-            # `pull --ff-only origin <branch>` given the fresh tracking ref;
-            # the divergence fallback below is unchanged.
-            pull_result = subprocess.run(
-                git_cmd + ["merge", "--ff-only", f"origin/{branch}"],
-                cwd=_m().PROJECT_ROOT,
-                capture_output=True,
-                text=True, encoding="utf-8", errors="replace",
-            )
-            if pull_result.returncode != 0:
-                # ff-only failed — local and remote have diverged (e.g. upstream
-                # force-pushed or rebase).  Since local changes are already
-                # stashed, reset to match the remote exactly.
-                print(
-                    "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
-                )
-                reset_result = subprocess.run(
-                    git_cmd + ["reset", "--hard", f"origin/{branch}"],
+            if target_kind == "tag":
+                checkout_result = subprocess.run(
+                    git_cmd + ["checkout", "--detach", target_sha],
                     cwd=_m().PROJECT_ROOT,
                     capture_output=True,
                     text=True, encoding="utf-8", errors="replace",
                 )
-                if reset_result.returncode != 0:
-                    print(f"✗ Failed to reset to origin/{branch}.")
-                    if reset_result.stderr.strip():
-                        print(f"  {reset_result.stderr.strip()}")
-                    print(
-                        f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
-                    )
+                if checkout_result.returncode != 0:
+                    if auto_stash_ref is not None:
+                        _m()._restore_stashed_changes(
+                            git_cmd,
+                            _m().PROJECT_ROOT,
+                            auto_stash_ref,
+                            prompt_user=False,
+                            input_fn=gw_input_fn,
+                        )
+                        auto_stash_ref = None
+                    print(f"✗ Failed to checkout tag '{target}'.")
+                    if checkout_result.stderr.strip():
+                        print(f"  {checkout_result.stderr.strip().splitlines()[0]}")
                     sys.exit(1)
+            else:
+                # Merge the ref fetched above instead of performing a second
+                # network fetch. Diverged branch history keeps its existing
+                # reset-to-origin fallback.
+                pull_result = subprocess.run(
+                    git_cmd + ["merge", "--ff-only", f"origin/{branch}"],
+                    cwd=_m().PROJECT_ROOT,
+                    capture_output=True,
+                    text=True, encoding="utf-8", errors="replace",
+                )
+                if pull_result.returncode != 0:
+                    print(
+                        "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
+                    )
+                    reset_result = subprocess.run(
+                        git_cmd + ["reset", "--hard", f"origin/{branch}"],
+                        cwd=_m().PROJECT_ROOT,
+                        capture_output=True,
+                        text=True, encoding="utf-8", errors="replace",
+                    )
+                    if reset_result.returncode != 0:
+                        print(f"✗ Failed to reset to origin/{branch}.")
+                        if reset_result.stderr.strip():
+                            print(f"  {reset_result.stderr.strip()}")
+                        print(
+                            f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
+                        )
+                        sys.exit(1)
 
             # Post-pull syntax guard: validate critical-path files actually
             # parse before declaring the update successful. If a bad commit
@@ -4000,18 +4150,29 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 if pre_pull_sha:
                     print()
                     print(f"→ Rolling back to {pre_pull_sha[:10]}...")
+                    if target_kind == "tag" and current_branch != "HEAD":
+                        rollback_args = ["checkout", current_branch]
+                    elif target_kind == "tag":
+                        rollback_args = ["checkout", "--detach", pre_pull_sha]
+                    else:
+                        rollback_args = ["reset", "--hard", pre_pull_sha]
+                    manual_rollback = _format_shell_command(git_cmd + rollback_args)
                     rollback_result = subprocess.run(
-                        git_cmd + ["reset", "--hard", pre_pull_sha],
+                        git_cmd + rollback_args,
                         cwd=_m().PROJECT_ROOT,
                         capture_output=True,
                         text=True, encoding="utf-8", errors="replace",
                     )
                     if rollback_result.returncode == 0:
                         print("  ✓ Rollback complete — your install is unchanged.")
-                        print("  Try ``hermes update`` again later once a fix lands.")
+                        if target_kind == "tag":
+                            print("  Choose a different tag or update from main.")
+                        else:
+                            print("  Try ``hermes update`` again later once a fix lands.")
                     else:
                         print("  ✗ Rollback failed. Recover manually with:")
-                        print(f"    cd {_m().PROJECT_ROOT} && git reset --hard {pre_pull_sha}")
+                        print(f"    From {_m().PROJECT_ROOT}, run:")
+                        print(f"      {manual_rollback}")
                         if rollback_result.stderr.strip():
                             print(f"    ({rollback_result.stderr.strip().splitlines()[0]})")
                 else:
@@ -4061,7 +4222,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         _m()._record_bytecode_fingerprint()
 
         # Fork upstream sync logic (only for main branch on forks)
-        if is_fork and branch == "main":
+        if target_kind == "branch" and is_fork and branch == "main":
             _m()._sync_with_upstream_if_needed(git_cmd, _m().PROJECT_ROOT)
 
         # Reinstall Python dependencies. Prefer .[all], but if one optional extra

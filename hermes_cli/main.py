@@ -9048,6 +9048,14 @@ def _resolve_update_branch(args) -> str:
     return (getattr(args, "branch", None) or "main").strip() or "main"
 
 
+def _resolve_update_target(args) -> tuple[str, str]:
+    """Return the requested Git target as ``("branch" | "tag", name)``."""
+    raw_tag = getattr(args, "tag", None)
+    if raw_tag is not None:
+        return "tag", str(raw_tag).strip()
+    return "branch", _resolve_update_branch(args)
+
+
 def _size_delta_label(saved_mb: float) -> str:
     """Human label for a before/after database size delta, in MB.
 
@@ -9062,7 +9070,7 @@ def _size_delta_label(saved_mb: float) -> str:
 
 
 def cmd_update(args):
-    """Update Hermes Agent to the latest version.
+    """Update Hermes Agent from Git.
 
     Thin wrapper around ``_cmd_update_impl``: installs hangup protection,
     runs the update, then restores stdio on the way out (even on
@@ -9087,6 +9095,13 @@ def cmd_update(args):
     # repository" text.  See format_docker_update_message() for the full
     # rationale and tag-pinning / config-persistence notes.
     install_method = detect_install_method(PROJECT_ROOT)
+    target_kind, target = _resolve_update_target(args)
+    if target_kind == "tag" and not target:
+        print("✗ --tag requires a non-empty Git tag name.")
+        sys.exit(1)
+    if target_kind == "tag" and install_method != "git":
+        print("✗ --tag is only supported for Git installations.")
+        sys.exit(1)
     if install_method == "docker":
         print(format_docker_update_message())
         sys.exit(1)
@@ -9096,12 +9111,11 @@ def cmd_update(args):
         sys.exit(1)
 
     if getattr(args, "check", False):
-        # --check honors --branch so the "any new commits?" answer matches
-        # what a subsequent `hermes update --branch=<x>` would actually pull.
-        branch = _resolve_update_branch(args)
+        # --check honors the selected target so its answer matches apply mode.
         _cmd_update_check(
-            branch=branch,
+            branch=target if target_kind == "branch" else "main",
             branch_explicit=bool(getattr(args, "branch", None)),
+            tag=target if target_kind == "tag" else None,
         )
         return
 

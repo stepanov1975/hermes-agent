@@ -1,7 +1,7 @@
 ---
 sidebar_position: 3
 title: "Updating & Uninstalling"
-description: "How to update Hermes Agent to the latest version or uninstall it"
+description: "How to update Hermes Agent to the latest version, install a Git tag, or uninstall it"
 ---
 
 # Updating & Uninstalling
@@ -25,8 +25,8 @@ This pulls the latest code from `main`, updates dependencies, and prompts you to
 When you run `hermes update`, the following steps occur:
 
 1. **Pre-update snapshot** — a lightweight state snapshot is saved by default (covers pairing data, cron jobs, `config.yaml`, `.env`, `auth.json`, and other state files that get modified at runtime; individual files over 1 GiB are skipped so a large sessions DB never slows the update down). Controlled by `updates.pre_update_backup` (`quick` by default, `full` for a zip of all of `HERMES_HOME`, `off` to disable). Recoverable via the snapshot restore flow described under [Snapshots and rollback](../user-guide/checkpoints-and-rollback.md).
-2. **Git pull** — pulls the latest code from the `main` branch and updates submodules
-3. **Post-pull syntax validation + auto-rollback** — after the pull, Hermes compiles the nine critical files every `hermes` invocation imports at startup. If any fails to parse (e.g. an orphan merge-conflict marker, an accidentally truncated file), Hermes runs `git reset --hard <pre-pull-sha>` to roll the install back so your shell stays bootable. Re-run `hermes update` once the upstream fix lands.
+2. **Git update** — pulls the selected branch, or checks out the exact tag requested with `--tag`
+3. **Post-update syntax validation + auto-rollback** — Hermes compiles the nine critical files every `hermes` invocation imports at startup. If any fails to parse (e.g. an orphan merge-conflict marker, an accidentally truncated file), Hermes restores the prior branch or detached commit so your shell stays bootable.
 4. **Dependency install** — runs `uv pip install -e ".[all]"` to pick up new or changed dependencies
 5. **Config migration** — detects new config options added since your version and prompts you to set them
 6. **Gateway auto-restart** — running gateways are refreshed after the update completes so the new code takes effect immediately. Service-managed gateways (systemd on Linux, launchd on macOS) are restarted through the service manager. Manual gateways are relaunched automatically when Hermes can map the running PID back to a profile.
@@ -41,6 +41,19 @@ hermes update --check --branch experimental   # preview behindness only
 ```
 
 If your local checkout is on a different branch, Hermes auto-stashes any uncommitted work, switches HEAD to the target branch, and then pulls. Branches that don't exist locally are auto-tracked from `origin/<name>` (`git checkout -B <name> origin/<name>`). Branches that don't exist anywhere fail cleanly — your stashed changes are restored before exit so you're never stranded in a weird state. The `main`-only fork-upstream sync logic is automatically skipped on non-`main` branches.
+
+### Updating to an exact Git tag: `--tag`
+
+Git installations can install a specific release tag instead of a branch tip:
+
+```bash
+hermes update --tag v2026.7.30
+hermes update --check --tag v2026.7.30
+```
+
+`--tag` and `--branch` are mutually exclusive. Hermes fetches only the requested tag from `origin`, resolves annotated tags to their commit, and leaves the checkout in detached-HEAD state at that exact commit. An ordinary later `hermes update` switches back to `main` using the existing branch-update behavior.
+
+Tag selection is Git-only. Hermes does not translate a Git tag into a PyPI, Docker, or Nix version, and the Windows ZIP fallback refuses `--tag` because copying an archive cannot produce a coherent exact-tag checkout. Local uncommitted changes use the existing auto-stash and restore flow.
 
 ### Local changes on non-interactive updates
 
@@ -62,7 +75,7 @@ In the desktop app this is **Settings → Advanced → In-App Update Local Chang
 
 ### Preview-only: `hermes update --check`
 
-Want to know if an update is available before pulling? Run `hermes update --check` — it fetches and compares commits against `origin/main`. No files are modified, no gateway is restarted. Useful in scripts and cron jobs that gate on "is there an update".
+Want to know if an update is available before pulling? Run `hermes update --check` — it fetches and compares commits against `origin/main`. Add `--branch <name>` or `--tag <tag>` to check that exact target. No working-tree files are modified and no gateway is restarted. Useful in scripts and cron jobs that gate on "is there an update".
 
 ### Full pre-update backup: `--backup`
 
