@@ -29,7 +29,7 @@ import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 
 SCANNER_VERSION = "skills-guard-v1"
@@ -784,7 +784,7 @@ def scan_skill_cached(
     return result, provenance
 
 
-def should_allow_install(result: ScanResult, force: bool = False) -> Tuple[bool, str]:
+def should_allow_install(result: ScanResult, force: bool = False) -> Tuple[Optional[bool], str]:
     """
     Determine whether a skill should be installed based on scan result and trust.
 

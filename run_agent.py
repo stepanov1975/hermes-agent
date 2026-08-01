@@ -4184,9 +4184,9 @@ class AIAgent:
 
         Called at the end of ``run_conversation`` with the cleaned user
         message (``original_user_message``) and the finalised assistant
-        response.  The external memory backend gets both ``sync_all`` (to
-        persist the exchange) and ``queue_prefetch_all`` (to start
-        warming context for the next turn) in one shot.
+        response.  The external memory backend gets ``sync_all`` to persist
+        the exchange and, for reusable sessions, ``queue_prefetch_all`` to
+        start warming context for the next turn.
 
         Uses ``original_user_message`` rather than ``user_message``
         because the latter may carry injected skill content that bloats
@@ -4230,7 +4230,10 @@ class AIAgent:
             # next turn's recall with a trivial prompt ("hi", "thanks") keys
             # provider searches on zero-signal text — skip it. The sync above
             # still runs so the turn itself is persisted.
-            if not is_trivial_prompt(user_text):
+            if (
+                not getattr(self, "_skip_memory_prefetch_after_turn", False)
+                and not is_trivial_prompt(user_text)
+            ):
                 self._memory_manager.queue_prefetch_all(
                     user_text,
                     session_id=self.session_id or "",
