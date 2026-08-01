@@ -61,8 +61,8 @@ Config file: `~/.hermes/hindsight/config.json`
 |-----|---------|-------------|
 | `bank_id` | `hermes` | Memory bank name (static fallback used when `bank_id_template` is unset or resolves empty) |
 | `bank_id_template` | — | Optional template to derive the bank name dynamically. Placeholders: `{profile}`, `{workspace}`, `{platform}`, `{user}`, `{session}`. Example: `hermes-{profile}` isolates memory per active Hermes profile. Empty placeholders collapse cleanly (e.g. `hermes-{user}` with no user becomes `hermes`). |
-| `bank_mission` | — | Reflect mission (identity/framing for reflect reasoning). Applied via Banks API. |
-| `bank_retain_mission` | — | Retain mission (steers what gets extracted). Applied via Banks API. |
+| `bank_mission` | — | Reflect mission (identity/framing for reflect reasoning). Applied via Hindsight's Banks API when present; set to an empty string/null to clear the bank-level override. |
+| `bank_retain_mission` | — | Retain mission (steers what gets extracted). Applied via Hindsight's Banks API when present; set to an empty string/null to clear the bank-level override. |
 
 ### Recall
 
@@ -76,7 +76,8 @@ Config file: `~/.hermes/hindsight/config.json`
 | `recall_tags` | — | Tags to filter when searching memories |
 | `recall_tags_match` | `any` | Tag matching mode: `any` / `all` / `any_strict` / `all_strict` |
 | `recall_types` | `observation` | Fact types surfaced by recall (both auto-recall and the `hindsight_recall` tool). Comma-separated string or JSON list. **Default narrowed to `observation` only** (see "Behavior change" below). Set to `observation,world,experience` to also include raw facts. |
-| `auto_recall` | `true` | Automatically recall memories before each turn |
+| `auto_recall` | `true` | Enable automatic memory-context injection (`recall_sync` controls when recall runs) |
+| `recall_sync` | `false` | Recall against the current user message before the turn. Adds recall latency, but avoids an empty first turn and previous-turn context. When `false`, recall stays on the existing background path. |
 
 > **Behavior change — `recall_types` defaults to `observation` only.**
 >
@@ -95,6 +96,7 @@ Config file: `~/.hermes/hindsight/config.json`
 | `retain_every_n_turns` | `1` | Retain every N turns (1 = every turn) |
 | `retain_context` | `conversation between Hermes Agent and the User` | Context label for retained memories |
 | `retain_tags` | — | Default tags applied to retained memories; merged with per-call tool tags |
+| `observation_scopes` | — | How Hindsight scopes derived observations during consolidation. Accepts `combined`, `per_tag`, `all_combinations`, or explicit JSON tag-scope lists. |
 | `retain_source` | — | Optional `metadata.source` attached to retained memories |
 | `retain_user_prefix` | `User` | Label used before user turns in auto-retained transcripts |
 | `retain_assistant_prefix` | `Assistant` | Label used before assistant turns in auto-retained transcripts |
