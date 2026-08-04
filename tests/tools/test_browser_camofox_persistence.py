@@ -9,6 +9,7 @@ import json
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
 from tools.browser_camofox import (
     _drop_session,
@@ -121,6 +122,40 @@ class TestManagedPersistenceMode:
         tab_requests = [req for req in requests_seen if "userId" in req]
         assert len(tab_requests) == 2
         assert tab_requests[0]["userId"] == tab_requests[1]["userId"]
+
+    def test_navigate_recovers_when_server_reports_restarted_browser(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+
+        stale_response = MagicMock(status_code=410)
+        stale_error = requests.HTTPError(response=stale_response)
+
+        with (
+            _enable_persistence(),
+            patch("tools.browser_camofox._post", side_effect=stale_error) as mock_post,
+            patch(
+                "tools.browser_camofox.requests.post",
+                return_value=_mock_response(
+                    json_data={"tabId": "fresh-tab", "url": "https://example.com"}
+                ),
+            ) as mock_create,
+            patch(
+                "tools.browser_camofox._get",
+                return_value={"snapshot": "", "refsCount": 0},
+            ),
+        ):
+            session = _get_session("task-1")
+            session["tab_id"] = "stale-tab"
+            result = json.loads(
+                camofox_navigate("https://example.com", task_id="task-1")
+            )
+
+        assert result["success"] is True
+        assert _get_session("task-1")["tab_id"] == "fresh-tab"
+        mock_post.assert_called_once()
+        mock_create.assert_called_once()
 
 
 class TestConfiguredCamofoxIdentity:

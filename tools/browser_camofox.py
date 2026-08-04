@@ -511,11 +511,13 @@ def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
                     timeout=60,
                 )
             except requests.HTTPError as e:
-                if e.response is not None and e.response.status_code == 404:
+                status_code = e.response.status_code if e.response is not None else None
+                if status_code in {404, 410}:
                     logger.warning(
-                        "Camofox tab %s returned 404 — tab was garbage collected. "
+                        "Camofox tab %s returned %s — tab no longer exists. "
                         "Creating a fresh tab.",
                         session["tab_id"],
+                        status_code,
                     )
                     session["tab_id"] = None
                     session = _ensure_tab(task_id, browser_url)
