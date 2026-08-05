@@ -695,6 +695,18 @@ class TestLifecycleGuardModule:
         )
         assert result is False
 
+    def test_embedded_nul_remote_payload_does_not_crash_guard(self):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            "/remote/workspace/python -c 'print(1)'",
+            read_remote_script=lambda _path: "\x7fELF\x00/tmp/inner",
+        )
+
+        assert result is False
+
     def test_shell_script_reference_walk_still_works(self, tmp_path):
         """The referenced-script walk still applies to real shell scripts:
         a .sh script that itself invokes a lifecycle command is caught."""
@@ -822,6 +834,51 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
         assert result["exit_code"] == 1
         assert "referenced script" in result["error"]
         assert any("cat" in c for c in calls)
+
+    def test_local_binary_reference_is_not_recursively_scanned(self, monkeypatch, tmp_path):
+        import tools.terminal_tool as tt
+
+        binary = tmp_path / "python"
+        binary.write_bytes(b"\x7fELF\x00/tmp/inner")
+        calls = []
+
+        class _LocalEnv:
+            env = {}
+            cwd = str(tmp_path)
+
+            def execute(self, command, **kwargs):
+                calls.append(command)
+                return {"output": "ok", "returncode": 0}
+
+        self._patch_env(monkeypatch, _LocalEnv(), inside_gateway=True)
+
+        result = json.loads(tt.terminal_tool(command=f"{binary} -c 'print(1)'"))
+
+        assert result["exit_code"] == 0
+        assert not any(command.startswith("cat ") for command in calls)
+
+    def test_remote_binary_reference_is_not_recursively_scanned(self, monkeypatch, tmp_path):
+        import tools.terminal_tool as tt
+
+        script = "/remote/workspace/python"
+        calls = []
+
+        class _RemoteEnv:
+            env = {}
+            cwd = "/remote/workspace"
+
+            def execute(self, command, **kwargs):
+                calls.append(command)
+                if command.startswith("cat "):
+                    return {"output": "\x7fELF\x00/tmp/inner", "returncode": 0}
+                return {"output": "ok", "returncode": 0}
+
+        self._patch_env(monkeypatch, _RemoteEnv(), inside_gateway=True)
+
+        result = json.loads(tt.terminal_tool(command=f"{script} -c 'print(1)'"))
+
+        assert result["exit_code"] == 0
+        assert any(command.startswith("cat ") for command in calls)
 
 
 class TestCronCreateLifecycleBlockExtra:

@@ -258,7 +258,10 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
-    except OSError:
+    except (OSError, ValueError):
+        # ValueError covers a malicious/garbled remote payload that was
+        # tokenized into a path containing an embedded NUL. The lifecycle
+        # guard must never crash while deciding whether a command is safe.
         return None, False
     try:
         metadata = os.fstat(descriptor)
@@ -327,6 +330,11 @@ def _contains_unsafe_gateway_action(
         if script_text is None and read_remote_script is not None:
             # Local path missing; try the remote backend if one is available.
             script_text = read_remote_script(str(script_path))
+        if script_text and "\x00" in script_text:
+            # Remote readers return text rather than bytes. Mirror the local
+            # binary check before recursive tokenization so ELF/Mach-O/PE data
+            # cannot become junk script paths or exhaust the depth guard.
+            continue
         if not script_text:
             continue
         # Relative references inside a script resolve against that script's
