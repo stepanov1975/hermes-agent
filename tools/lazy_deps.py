@@ -254,7 +254,14 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
 
     # ─── Terminal backends ─────────────────────────────────────────────────
     "terminal.modal": ("modal==1.3.4",),
-    "terminal.daytona": ("daytona==0.155.0",),
+    # Daytona permits any OpenTelemetry aiohttp instrumentation >=0.59b0. Left
+    # unconstrained, a lazy refresh currently selects 0.65b0, which requires
+    # semantic-conventions 0.65b0 and conflicts with export.otlp's SDK 1.39.1
+    # (semantic-conventions 0.60b1). Keep both activated backends installable.
+    "terminal.daytona": (
+        "daytona==0.155.0",
+        "opentelemetry-instrumentation-aiohttp-client==0.60b1",
+    ),
     "terminal.vercel": ("vercel==0.7.2",),
 
     # ─── Skills ────────────────────────────────────────────────────────────

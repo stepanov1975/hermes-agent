@@ -75,6 +75,13 @@ class TestSpecSafety:
 
 
 class TestAllowlist:
+    def test_daytona_pin_is_compatible_with_otlp_exporter(self):
+        """Daytona's broad OTEL range must not break the pinned OTLP SDK."""
+        assert (
+            "opentelemetry-instrumentation-aiohttp-client==0.60b1"
+            in ld.LAZY_DEPS["terminal.daytona"]
+        )
+
     def test_unknown_feature_raises(self, monkeypatch):
         monkeypatch.setattr(ld, "_allow_lazy_installs", lambda: True)
         with pytest.raises(ld.FeatureUnavailable, match="not in LAZY_DEPS"):
