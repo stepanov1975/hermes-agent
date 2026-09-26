@@ -1,19 +1,17 @@
 # Hermes Agent - Development Guide
 
-Instructions for AI coding assistants and developers working on the hermes-agent codebase.
-This root file holds only what applies everywhere. Each area has its own `AGENTS.md` (aim for
-~8k chars; `agent/subdirectory_hints.py` delivers up to 32k and truncates head/tail with a warning
-past that); see the **routing table** at the end and read the area file before editing in that area.
+Instructions for AI coding assistants and developers. This root file holds cross-cutting rules;
+each area has its own `AGENTS.md` (aim for ~8k chars). `agent/subdirectory_hints.py` delivers up
+to 32k, then warns and truncates head/tail. Read the area's file via the **routing table** below.
 
 **Never give up on the right solution.**
 
 ## What Hermes Is
 
-Hermes is a personal AI agent that runs the same agent core across a CLI, a messaging
-gateway (Telegram, Discord, Slack, ~20 platforms), a TUI, and an Electron desktop app. It
-learns across sessions (memory + skills), delegates to subagents, runs scheduled jobs, and
-drives a real terminal and browser. It is extended primarily through **plugins and skills**,
-not by growing the core.
+Hermes is a personal AI agent with one core across CLI, messaging gateway (Telegram, Discord,
+Slack, ~20 platforms), TUI, and Electron desktop. It learns across sessions (memory + skills),
+delegates, schedules jobs, and drives a real terminal and browser. Extend it primarily through
+**plugins and skills**, not core growth.
 
 Two invariants shape almost every design decision and are the lens for reviewing any change:
 
@@ -30,17 +28,14 @@ Two invariants shape almost every design decision and are the lens for reviewing
 
 ## Contribution Rubric — What We Want / What We Don't
 
-The project's intent layer. It serves humans aiming a contribution AND the automated triage
-sweeper, which may only close on `implemented_on_main`, `cannot_reproduce`, or `incoherent`.
-Taste-based "out of scope" closes are a human maintainer's call; the sweeper's job is to
-recognize design intent and *avoid wrongly closing a legitimate contribution*.
+This intent layer guides contributors and the automated triage sweeper. The sweeper may close
+only as `implemented_on_main`, `cannot_reproduce`, or `incoherent`; taste-based "out of scope"
+is a human maintainer's call. Avoid wrongly closing legitimate contributions.
 
-Read the balance right: Hermes ships a **lot**. Most merges are bug fixes to reported
-behavior, and the product surface (platforms, providers, models, desktop/TUI features)
-expands aggressively on purpose. The restraint below targets the **core agent + model tool
-schema**, the one place where every addition is paid for on every API call. "Smallest
-footprint" governs *how a capability is wired into the core*, not whether the product may
-grow: expansive at the edges, conservative at the waist.
+Hermes deliberately expands its product surface (platforms, providers, models, desktop/TUI),
+and most merges fix reported bugs. Restraint targets the **core agent + model tool schema**:
+every addition is paid for on every API call. "Smallest footprint" governs *wiring*, not
+whether the product may grow: expansive at the edges, conservative at the waist.
 
 ### What we want
 
@@ -103,9 +98,8 @@ grow: expansive at the edges, conservative at the waist.
 
 ### Before you call it a bug — verify the premise (and when NOT to close)
 
-The most common reason a well-written PR is closed is a **wrong premise** or treating an
-**intentional design as a gap**. These patterns tell a reviewer what to scrutinize and tell
-the sweeper when a PR is NOT safe to close (when in doubt, leave it open for a human):
+Well-written PRs are often closed for a **wrong premise** or mistaking **intentional design
+for a gap**. Review these patterns; when unsure, the sweeper leaves the PR open for a human:
 
 - **"Intentional design, not a gap."** Ask whether the isolation IS the design. Profiles are
   independent islands on purpose: a PR adding live config inheritance from the default
@@ -125,10 +119,8 @@ the sweeper when a PR is NOT safe to close (when in doubt, leave it open for a h
   base, or reviving a direction maintainers closed, is rejected even when it works. Offer the
   rest as a focused follow-up.
 
-Throughline: **verify the claim AND the intent against the codebase before writing or merging
-a fix.** A reproduction on current `main` plus a line-level account beats a plausible
-rationale. When unsure about intent, asking is cheaper than shipping a fix that fights the
-design.
+**Verify claim and intent against the codebase before writing or merging a fix.** Reproduction
+on current `main` plus a line-level account beats rationale; ask if intent is unclear.
 
 ### The Footprint Ladder (new capability decision)
 
@@ -153,13 +145,11 @@ Choose the highest (least-footprint) rung that correctly solves the problem:
 
 ### Surface capability is a property of the SESSION, never of the process env
 
-A tool that works only because of *who is on the other end* (desktop panes, in-app browser,
-message reactions, Projects) must resolve availability from the **session's own source**, not
-from an env var on the backend. Client and backend are separate machines: the desktop app may
-drive a locally spawned backend, one over SSH, one behind URL + token, or Hermes Cloud, and
-only the first two carry `HERMES_DESKTOP=1`. An env-keyed gate is a silent no-op on the other
-topologies — the tool is stripped from the schema while the platform hint tells the model it
-is "inside the Hermes desktop app". The pattern:
+Tools dependent on *who is on the other end* (desktop panes, in-app browser, reactions,
+Projects) resolve availability from the **session's source**, not backend env. The desktop
+client may use a local backend, SSH, URL + token, or Hermes Cloud; only the first two carry
+`HERMES_DESKTOP=1`. Env gating silently strips the tool on the others even while the platform
+hint says "inside the Hermes desktop app". Instead:
 
 - **The toolset is the surface gate.** Keep such tools off `_HERMES_CORE_TOOLS` and in a named
   toolset (`desktop_ui`, `project`); the GUI gateway's `_load_enabled_toolsets(platform)`
@@ -226,9 +216,9 @@ profile-aware via `get_hermes_home()`. Browse logs with `hermes logs [--follow] 
 
 ### Facade + siblings layout (Sep 2026 decomposition)
 
-Every former god file is a **facade** (public entry points + the names other packages import)
-plus **siblings** `<stem>_<topic>.py` in the same directory, each owning one topic. Largest
-families: `hermes_state.py` (21), `gateway/run.py` (15), `tools/mcp_tool.py` (15),
+Former god files are **facades** (public entry points + imported names) with topical siblings
+`<stem>_<topic>.py` in the same directory. Largest families:
+`hermes_state.py` (21), `gateway/run.py` (15), `tools/mcp_tool.py` (15),
 `hermes_cli/kanban.py` (14), `hermes_cli/web_server.py` (13 + 24 routers), `hermes_cli/auth.py`
 (12), `tools/browser_tool.py` (11), `cli.py` (12 `hermes_cli/cli_*_mixin.py`), `run_agent.py`
 (`agent/turn_*.py`, `agent_init.py`, `conversation_loop.py`).
@@ -286,34 +276,30 @@ families: `hermes_state.py` (21), `gateway/run.py` (15), `tools/mcp_tool.py` (15
   spawns (`served_profile_child_env`, never `os.environ.copy()`). Fail-closed reads exist only after
   `set_multiplex_active(True)`. Prove live with two homes (A→B→A) under multiplex, not one temp
   `HERMES_HOME`. Advisory lint: `scripts/check_profile_scope_patterns.py`.
-- **Machine facts and resource lookup go through `hermes_platform`.** `hermes_platform.host` is the
-  one answer for OS family, native architecture (`IsWow64Process2` → `platform.machine()`; never
-  `PROCESSOR_ARCHITECTURE` alone, it reads AMD64 under x64-on-ARM64 emulation), CPU identity, and
-  WSL/container/Termux. Facts are cached per process and take **no environment-variable input**, so
-  a hardware recognizer (`host/products.py`) cannot be set from a shell. Distinguish the control
-  host (where this Python runs) from the terminal execution target (SSH/container) and the Desktop
-  client (another machine): `host.*` answers only the first. A new bare `shutil.which` or a
-  hand-written known-path table outside `hermes_platform/` fails
-  `tests/test_managed_runtime_resolution.py` unless allowlisted with a reason; resolvers land in
-  `hermes_platform/resolver/`. Lookup never installs, downloads, or starts anything.
+- **Machine facts and resource lookup go through `hermes_platform`.** `hermes_platform.host`
+  owns OS family, native architecture (`IsWow64Process2` → `platform.machine()`; never
+  `PROCESSOR_ARCHITECTURE` alone: x64-on-ARM64 reports AMD64), CPU, and WSL/container/Termux.
+  Facts are process-cached, take **no env input**, and cannot be faked via shell for
+  `host/products.py`. `host.*` answers for the control host, not an SSH/container terminal
+  target or remote Desktop client. New bare `shutil.which` or known-path tables outside
+  `hermes_platform/` fail `tests/test_managed_runtime_resolution.py` unless reason-allowlisted;
+  resolvers belong in `hermes_platform/resolver/`. Lookup never installs/downloads/starts.
 - **Argparse alias dispatch:** `add_parser("list", aliases=["ls"])` sets `dest` to the literal
   the user typed (`"ls"`). Dispatch must accept both (caught PTY-testing `hermes webhook ls`).
 - **Don't wire in dead code without E2E validation.** Unshipped code was dead for a reason;
-  E2E the real resolution chain with real imports against a temp `HERMES_HOME` first.
+  test the real resolution chain with real imports and a temp `HERMES_HOME` first.
 
 ### TypeScript style (desktop, TUI, website, future TS packages)
 
-Small nanostores over component state when state is shared or read by distant UI; each
-feature owns its atoms (chat near chat, shared in `src/store`); rendering components use
-`useStore`, non-rendering actions read `$atom.get()`; never thread state through three
-components when the leaf can subscribe; persistence sits beside the atom that owns it. Route
-roots stay thin (compose routes + shell, never controllers). No monolithic hooks — one narrow
-job each; colocated action modules over god hooks. Pure side-effect callbacks use the terse
-void form `onState={st => void setGatewayState(st)}`; async handlers make intent explicit
-`onClick={() => void save()}`. Interfaces for public props and shared object shapes (not
-`type X = {...}`); extend React primitives (`React.ComponentProps<'button'>`, `Omit`, `Pick`).
-Table-driven beats condition ladders for ids/routes/views. `src/app` owns routes/pages,
-`src/store` shared atoms, `src/lib` pure helpers.
+Use small nanostores for shared/distant UI state; each feature owns atoms (chat near chat,
+shared in `src/store`). Renderers use `useStore`, non-rendering actions `$atom.get()`; don't
+thread state through three components when a leaf can subscribe. Persist beside the owning
+atom. Keep route roots thin (routes + shell, not controllers), hooks narrow, and actions
+colocated rather than in god hooks. Pure callbacks: `onState={st => void setGatewayState(st)}`;
+async: `onClick={() => void save()}`. Use interfaces for public props/shared shapes, not
+`type X = {...}`; extend primitives (`React.ComponentProps<'button'>`, `Omit`, `Pick`). Use
+tables over id/route/view ladders. `src/app` owns routes/pages, `src/store` shared atoms,
+`src/lib` pure helpers.
 
 ## Dependency Pinning Policy
 
@@ -414,23 +400,21 @@ spawn a launcher/worker chain).
 
 ### Don't write change-detector tests
 
-A change-detector fails whenever data *expected to change* is updated — model catalogs,
-`_config_version`, enumeration counts, hardcoded model lists. It adds no coverage and taxes
-every routine update. Don't: `assert "gemini-2.5-pro" in _PROVIDER_MODELS["gemini"]`,
-`assert DEFAULT_CONFIG["_config_version"] == 21`, `assert len(models) == 8`. Do: `assert
-"gemini" in _PROVIDER_MODELS and len(_PROVIDER_MODELS["gemini"]) >= 1` (plumbing works);
+A change-detector freezes data *expected to change* (model catalogs, `_config_version`, counts,
+model lists); it adds no coverage and taxes updates. Don't freeze a model name
+(`assert "gemini-2.5-pro" in _PROVIDER_MODELS["gemini"]`), config version
+(`assert DEFAULT_CONFIG["_config_version"] == 21`), or count (`assert len(models) == 8`).
+Do assert plumbing: `assert "gemini" in _PROVIDER_MODELS and len(_PROVIDER_MODELS["gemini"]) >= 1`;
 `assert raw["_config_version"] == DEFAULT_CONFIG["_config_version"]` (migration reaches
 latest); `assert not (set(moonshot_models) & coding_plan_only_models)` (no leak); every
-catalog model has a context-length entry (relationship). If it reads like a snapshot, delete
-it; if it reads like a contract between two pieces of data, keep it. Reviewers reject new
-change-detectors; authors convert them before re-review.
+catalog model has a context-length entry (relationship). Keep contracts between data, not
+snapshots; reviewers reject new change-detectors and authors convert them before re-review.
 
 ### Never read source code in tests
 
-A test that reads a `.py`/`.ts`/`.tsx` file's text tests the *shape of the source*, not
-behavior — banned outright. It passes when the implementation is subtly broken (regex matches
-a mis-wired call site) and fails on correct refactors; it can't run against bundled/minified
-artifacts; it blocks structural cleanup; it gives false confidence. Don't
+A test reading `.py`/`.ts`/`.tsx` text checks source *shape*, not behavior — banned. Regex can
+match mis-wiring, fail correct refactors, and miss bundled/minified artifacts, blocking cleanup
+while giving false confidence. Don't
 `fs.readFileSync('main.ts')` + `assert.match(source, /spawn\(...hiddenWindowsChildOptions/)`.
 Do extract the logic into a pure/DI-testable function and call it:
 ```ts
@@ -439,8 +423,7 @@ export function hiddenWindowsChildOptions(options = {}, isWindows = process.plat
   return { ...options, windowsHide: true }
 }
 ```
-If the logic lives inline in a god-file and extraction feels disruptive, that is the signal to
-extract, not to regex around it.
+If logic is inline in a god-file, extract rather than regex around it.
 
 ## Routing Table — working in X → read X/AGENTS.md
 
